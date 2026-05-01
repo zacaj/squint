@@ -12,6 +12,8 @@
 #endif
 #ifdef COPY_CURSOR
 #include <X11/extensions/Xfixes.h>
+#endif
+#ifdef HAVE_XRENDER
 #include <X11/extensions/Xrender.h>
 #endif
 #ifdef HAVE_XDAMAGE
@@ -79,9 +81,44 @@ static uint32_t* cursor_pixels;
 static int xrandr_event_base = 0;
 #endif
 
+#ifdef HAVE_XRENDER
+static double scale_factor = 1.0;
+static int scaled_w, scaled_h, scaled_off_x, scaled_off_y;
+static Picture scale_src_picture = 0;
+static Picture scale_dst_picture = 0;
+#endif
+
 gboolean x11_draw_cursor();
 gboolean x11_clear_cursor();
 void x11_redraw_cursor(gboolean do_clear);
+
+#ifdef HAVE_XRENDER
+static void
+x11_update_scale(int dst_w, int dst_h)
+{
+	double sx = (double)dst_w / src_rect.width;
+	double sy = (double)dst_h / src_rect.height;
+	scale_factor = (sx < sy) ? sx : sy;
+	scaled_w     = (int)(src_rect.width  * scale_factor);
+	scaled_h     = (int)(src_rect.height * scale_factor);
+	scaled_off_x = (dst_w - scaled_w) / 2;
+	scaled_off_y = (dst_h - scaled_h) / 2;
+}
+
+static void
+x11_repaint_scaled_rect(int x, int y, int w, int h)
+{
+	if (!scale_src_picture || !scale_dst_picture) return;
+	int dx = (int)(x * scale_factor);
+	int dy = (int)(y * scale_factor);
+	int dw = (int)((x + w) * scale_factor) - dx + 1;
+	int dh = (int)((y + h) * scale_factor) - dy + 1;
+	if (dw <= 0 || dh <= 0) return;
+	XRenderComposite(display, PictOpSrc,
+		scale_src_picture, None, scale_dst_picture,
+		dx, dy, 0, 0, dx, dy, dw, dh);
+}
+#endif
 
 
 void
@@ -123,6 +160,10 @@ x11_adjust_offset_value(gint* offset, gint src, gint dst, gint cursor)
 gboolean
 x11_fix_offset()
 {
+#ifdef HAVE_XRENDER
+	if (config.opt_scale)
+		return FALSE;
+#endif
 	GdkPoint offset_bak = {offset.x, offset.y};
 
 	// Adjust the offsets
@@ -180,6 +221,8 @@ x11_refresh_cursor_location(gboolean force)
 gboolean
 x11_refresh_image(const GdkRectangle* damaged_rect)
 {
+	if (!pixmap || !window) return FALSE;
+
 #ifdef HAVE_XI
 	if (!can_track_cursor)
 #endif
@@ -201,6 +244,11 @@ x11_refresh_image(const GdkRectangle* damaged_rect)
 	x11_draw_cursor();
 
 	// redraw the damaged area
+#ifdef HAVE_XRENDER
+	if (config.opt_scale && scale_src_picture)
+		x11_repaint_scaled_rect(x, y, damaged_rect->width, damaged_rect->height);
+	else
+#endif
 	XClearArea(display, window, x, y, damaged_rect->width, damaged_rect->height, FALSE);
 
 	XFlush (display);
@@ -826,6 +874,29 @@ x11_on_window_configure_event(GtkWidget *widget, GdkEvent *event, gpointer   use
 
 	if(!fullscreen) {
 		memcpy(&dst_rect, &rect, sizeof(rect));
+#ifdef HAVE_XRENDER
+		if (config.opt_scale && scale_src_picture) {
+			x11_update_scale(rect.width, rect.height);
+
+			// reposition and resize the sub-window
+			XMoveResizeWindow(display, window,
+				scaled_off_x, scaled_off_y, scaled_w, scaled_h);
+
+			// update the transform for the new scale
+			XTransform xform = {{
+				{ XDoubleToFixed(1.0/scale_factor), 0, 0 },
+				{ 0, XDoubleToFixed(1.0/scale_factor), 0 },
+				{ 0, 0, XDoubleToFixed(1.0) }
+			}};
+			XRenderSetPictureTransform(display, scale_src_picture, &xform);
+
+			// repaint the full sub-window
+			XRenderComposite(display, PictOpSrc,
+				scale_src_picture, None, scale_dst_picture,
+				0, 0, 0, 0, 0, 0, scaled_w, scaled_h);
+			XFlush(display);
+		} else
+#endif
 		if (x11_fix_offset()) {
 			XClearWindow(display, window);
 		}
@@ -1002,6 +1073,11 @@ x11_redraw_cursor(gboolean clear_window)
 		{
 			return;
 		}
+#ifdef HAVE_XRENDER
+		if (config.opt_scale && scale_src_picture)
+			x11_repaint_scaled_rect(rect.x, rect.y, rect.width, rect.height);
+		else
+#endif
 		XClearArea(display, window, rect.x, rect.y,
 				rect.width, rect.height, FALSE);
 	}
@@ -1040,9 +1116,37 @@ x11_enable_window()
 
 	// create the pixmap
 	pixmap = XCreatePixmap (display, root_window, src_rect.width, src_rect.height, depth);
-	
-	// create the sub-window
+
+#ifdef HAVE_XRENDER
+	if (config.opt_scale) {
+		x11_update_scale(dst_rect.width, dst_rect.height);
+
+		// sub-window is sized to the scaled area, no background pixmap
+		XSetWindowAttributes attr;
+		attr.background_pixel = 0;
+		window = XCreateWindow(display, squint_window,
+					scaled_off_x, scaled_off_y,
+					scaled_w, scaled_h,
+					0, CopyFromParent,
+					InputOutput, CopyFromParent,
+					CWBackPixel, &attr);
+		XMapWindow(display, window);
+
+		XRenderPictFormat *fmt = XRenderFindStandardFormat(display, PictStandardRGB24);
+		scale_src_picture = XRenderCreatePicture(display, pixmap, fmt, 0, NULL);
+		scale_dst_picture = XRenderCreatePicture(display, window, fmt, 0, NULL);
+
+		XTransform xform = {{
+			{ XDoubleToFixed(1.0/scale_factor), 0, 0 },
+			{ 0, XDoubleToFixed(1.0/scale_factor), 0 },
+			{ 0, 0, XDoubleToFixed(1.0) }
+		}};
+		XRenderSetPictureTransform(display, scale_src_picture, &xform);
+		XRenderSetPictureFilter(display, scale_src_picture, FilterBilinear, NULL, 0);
+	} else
+#endif
 	{
+		// create the sub-window
 		XSetWindowAttributes attr;
 		attr.background_pixmap = pixmap;
 		window = XCreateWindow (display, squint_window,
@@ -1066,9 +1170,17 @@ x11_enable_window()
 void
 x11_disable_window()
 {
+	// Ensure all pending X11 requests are processed before freeing resources
+	XSync(display, False);
+
 	XFreePixmap(display, backup_pixmap);
 	backup_pixmap = 0;
 	backup.x = -CURSOR_SIZE;
+
+#ifdef HAVE_XRENDER
+	if (scale_src_picture) { XRenderFreePicture(display, scale_src_picture); scale_src_picture = 0; }
+	if (scale_dst_picture) { XRenderFreePicture(display, scale_dst_picture); scale_dst_picture = 0; }
+#endif
 
 	XDestroyWindow(display, window);
 	window = 0;

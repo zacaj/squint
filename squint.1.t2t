@@ -16,7 +16,7 @@ squint - duplicate a monitor output into a X11 window
 
 = SYNOPSIS =[synopsis]
 
-**squint** [ -dvw ] [ -l N ] [ -r N ] [ SourceMonitorName ] [ DestinationMonitorName ]
+**squint** [ -dvws ] [ -l N ] [ -r N ] [ SourceMonitorName ] [ DestinationMonitorName ]
 
 = DESCRIPTION =[description]
 
@@ -49,6 +49,8 @@ Note: the passive mode is effective only when running in an ordinary window
 
 : **-r N, --rate N**
 use fixed refresh rate of N frames per second (default to 25fps when the XDamage extension is not available)
+: **-s, --scale**
+scale the source screen to fit the display area (requires XRender)
 : **-v, --version**
 display version information and exit
 : **-w, --window**

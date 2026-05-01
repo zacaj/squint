@@ -695,6 +695,7 @@ GOptionEntry option_entries[] = {
   { "passive",	'p',	0,	G_OPTION_ARG_NONE,	&config.opt_passive,	"Do not raise the window on user activity (has no effects in fullscreen mode)", NULL},
   { "rate",	'r',	0,	G_OPTION_ARG_INT,	&config.opt_rate,	"Use fixed refresh rate of N frames per second", "N"},
   { "version",	'v',	0,	G_OPTION_ARG_NONE,	&config.opt_version,	"Display version information and exit", NULL},
+  { "scale",	's',	0,	G_OPTION_ARG_NONE,	&config.opt_scale,	"Scale the source screen to fit the display area (requires XRender)", NULL},
   { "window",	'w',	0,	G_OPTION_ARG_NONE,	&config.opt_window,	"Run inside a window instead of going fullscreen", NULL},
   { NULL }
 };
