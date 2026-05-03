@@ -516,6 +516,26 @@ select_any_monitor_but(GdkDisplay* dsp, GdkMonitor** mon, GdkRectangle* rect, co
 }
 
 
+// If *name is a positive integer string, replace it with the name of that monitor (1-based).
+static void
+resolve_monitor_number(const char** name)
+{
+	if (!*name) return;
+	char* end;
+	long idx = strtol(*name, &end, 10);
+	if (*end != '\0' || idx < 1) return; // not a plain integer
+	int n = gdk_display_get_n_monitors(gdisplay);
+	if (idx > n) {
+		char buff[64];
+		g_snprintf(buff, sizeof(buff), "Monitor number %ld is out of range (1-%d)", idx, n);
+		squint_error(buff);
+		return;
+	}
+	GdkMonitor* mon = gdk_display_get_monitor(gdisplay, (int)(idx - 1));
+	g_free((gpointer)*name);
+	*name = g_strdup(gdk_monitor_get_model(mon));
+}
+
 //
 // select which monitor is going to be duplicated
 //
@@ -698,6 +718,8 @@ GOptionEntry option_entries[] = {
   { "version",	'v',	0,	G_OPTION_ARG_NONE,	&config.opt_version,	"Display version information and exit", NULL},
   { "scale",	's',	0,	G_OPTION_ARG_NONE,	&config.opt_scale,	"Scale the source screen to fit the display area (requires XRender)", NULL},
   { "window",	'w',	0,	G_OPTION_ARG_NONE,	&config.opt_window,	"Run inside a window instead of going fullscreen", NULL},
+  { "src",	'S',	0,	G_OPTION_ARG_STRING,	&config.src_monitor_name,	"Source monitor name or number (see --list-monitors)", "MONITOR"},
+  { "dst",	'D',	0,	G_OPTION_ARG_STRING,	&config.dst_monitor_name,	"Destination monitor name or number (see --list-monitors)", "MONITOR"},
   { NULL }
 };
 
@@ -733,7 +755,7 @@ main (int argc, char *argv[])
 	g_option_context_add_main_entries (context, option_entries, NULL);
 	g_option_context_add_group (context, gtk_get_option_group (TRUE));
 
-	if (!gtk_init_with_args (&argc, &argv, "[SourceMonitor [DestinationMonitor]]", option_entries, NULL, &err))
+	if (!gtk_init_with_args (&argc, &argv, "[SourceMonitor|N [DestinationMonitor|N]]", option_entries, NULL, &err))
 	{
 		squint_error(err->message);
 		return 1;
@@ -778,6 +800,10 @@ main (int argc, char *argv[])
 	if (!init()) {
 		return 1;
 	}
+
+	// Resolve numeric monitor specs now that gdisplay is available
+	resolve_monitor_number(&config.src_monitor_name);
+	resolve_monitor_number(&config.dst_monitor_name);
 
 	// activation
 	if (!config.opt_disable) {
