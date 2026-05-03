@@ -692,6 +692,7 @@ squint_disable()
 GOptionEntry option_entries[] = {
   { "disable",	'd',	0,	G_OPTION_ARG_NONE,	&config.opt_disable,	"Do not enable screen duplication at startup", NULL},
   { "limit",	'l',	0,	G_OPTION_ARG_INT,	&config.opt_limit,	"Limit refresh rate to N frames per second", "N"},
+  { "list-monitors",	'L',	0,	G_OPTION_ARG_NONE,	&config.opt_list_monitors,	"Print a numbered list of available monitors and exit", NULL},
   { "passive",	'p',	0,	G_OPTION_ARG_NONE,	&config.opt_passive,	"Do not raise the window on user activity (has no effects in fullscreen mode)", NULL},
   { "rate",	'r',	0,	G_OPTION_ARG_INT,	&config.opt_rate,	"Use fixed refresh rate of N frames per second", "N"},
   { "version",	'v',	0,	G_OPTION_ARG_NONE,	&config.opt_version,	"Display version information and exit", NULL},
@@ -699,6 +700,25 @@ GOptionEntry option_entries[] = {
   { "window",	'w',	0,	G_OPTION_ARG_NONE,	&config.opt_window,	"Run inside a window instead of going fullscreen", NULL},
   { NULL }
 };
+
+void
+list_monitors()
+{
+	int n = gdk_display_get_n_monitors(gdisplay);
+	if (n == 0) {
+		printf("No monitors found\n");
+		return;
+	}
+
+	printf("Available monitors:\n");
+	for (int i = 0; i < n; i++) {
+		GdkMonitor* mon = gdk_display_get_monitor(gdisplay, i);
+		const char* name = gdk_monitor_get_model(mon);
+		GdkRectangle rect;
+		gdk_monitor_get_geometry(mon, &rect);
+		printf("%d: %s %dx%d @(%d, %d)\n", i + 1, name, rect.width, rect.height, rect.x, rect.y);
+	}
+}
 
 int
 main (int argc, char *argv[])
@@ -723,6 +743,16 @@ main (int argc, char *argv[])
 
 	if (config.opt_version) {
 		puts(APPNAME " " VERSION);
+		return 0;
+	}
+
+	// initialisation
+	if (!init()) {
+		return 1;
+	}
+
+	if (config.opt_list_monitors) {
+		list_monitors();
 		return 0;
 	}
 

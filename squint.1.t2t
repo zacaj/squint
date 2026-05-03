@@ -16,7 +16,7 @@ squint - duplicate a monitor output into a X11 window
 
 = SYNOPSIS =[synopsis]
 
-**squint** [ -dvws ] [ -l N ] [ -r N ] [ SourceMonitorName ] [ DestinationMonitorName ]
+**squint** [ -dvwsL ] [ -l N ] [ -r N ] [ SourceMonitorName ] [ DestinationMonitorName ]
 
 = DESCRIPTION =[description]
 
@@ -33,6 +33,8 @@ available to do any other stuff.
 do not enable screen duplication at startup. Use this option if you want to start squint automatically at the X session startup
 : **-l N, --limit N**
 limit the refresh rate to N frames per second (default is 50fps), use '-l' 0 to disable limitation (not recommended)
+: **-L, --list-monitors**
+print a numbered list of available monitors and exit
 : **-p, --passive**
 do not raise the window on user activity
 
