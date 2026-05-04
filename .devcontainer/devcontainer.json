@@ -1,0 +1,18 @@
+{
+  "name": "squint",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "mesonbuild.mesonbuild"
+      ],
+      "settings": {
+        "C_Cpp.default.compileCommands": "${workspaceFolder}/builddir/compile_commands.json"
+      }
+    }
+  },
+  "postCreateCommand": "meson setup builddir --wipe 2>/dev/null || meson setup builddir"
+}
