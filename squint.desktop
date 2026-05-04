@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Squint
+Comment=Duplicate monitor output to X11 window
+Exec=squint
+Icon=squint
+Type=Application
+Categories=Utility;
+Keywords=monitor;presentation;display;
+Terminal=false
