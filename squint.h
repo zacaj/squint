@@ -24,12 +24,17 @@ extern GdkDisplay* gdisplay;
 
 extern GdkRectangle src_rect, dst_rect, active_window_rect;
 
+extern GdkRectangle* src_rects_list;
+extern int n_src_monitors;
+
 void squint_show();
 void squint_hide();
 void squint_disable();
+void squint_switch_source(int idx);
 
 void squint_error(const char* msg);
 
 gboolean x11_init();
 void x11_enable();
 void x11_disable();
+void x11_switch_source();

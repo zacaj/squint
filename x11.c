@@ -190,25 +190,37 @@ x11_refresh_cursor_location(gboolean force)
 	XQueryPointer(display, root_window, &root_return, &w,
 			&c.x, &c.y, &wx, &wy, &mask);
 
+	// check which (if any) listed source monitor contains the cursor
+	int found_idx = -1;
+	for (int i = 0; i < n_src_monitors; i++) {
+		int lx = c.x - src_rects_list[i].x;
+		int ly = c.y - src_rects_list[i].y;
+		if (lx >= 0 && ly >= 0 && lx < src_rects_list[i].width && ly < src_rects_list[i].height) {
+			found_idx = i;
+			break;
+		}
+	}
+
+	if (found_idx < 0) {
+		cursor.x = cursor.y = -1;
+		if (!config.opt_passive) {
+			squint_hide();
+		}
+		return;
+	}
+
+	// switch source if the cursor moved to a different listed monitor
+	if (memcmp(&src_rects_list[found_idx], &src_rect, sizeof(GdkRectangle)) != 0) {
+		squint_switch_source(found_idx);
+		// x11_enable_window() called by squint_switch_source will re-call us
+		return;
+	}
+
 	c.x -= src_rect.x;
 	c.y -= src_rect.y;
-
-	if ((c.x<0) | (c.y<0) | (c.x>=src_rect.width) | (c.y>=src_rect.height))
-	{
-		// cursor is outside the duplicated screen
-		c.x = c.y = -1;
-	}
-
-	// cursor was really moved
 	cursor = c;
 
-	if (cursor.x >= 0) {
-		/* raise the window when the pointer enters the duplicated screen */
-		squint_show();
-	} else {
-		/* lower the window when the pointer leaves the duplicated screen */
-		squint_hide();
-	}
+	squint_show();
 
 	// update the offsets and redraw the cursor
 	gboolean updated = x11_fix_offset();
@@ -443,17 +455,32 @@ x11_show_active_window()
 	if (!active_window)
 		return;
 
-	// check if it overlaps more whith the src or the dst window
-	GdkRectangle inter_src, inter_dst;
-	gdk_rectangle_intersect(&active_window_rect, &src_rect, &inter_src);
-	gdk_rectangle_intersect(&active_window_rect, &dst_rect, &inter_dst);
+	// find which listed source monitor the active window overlaps most
+	int best_src_idx = -1;
+	int best_src_area = 0;
+	for (int i = 0; i < n_src_monitors; i++) {
+		GdkRectangle inter;
+		gdk_rectangle_intersect(&active_window_rect, &src_rects_list[i], &inter);
+		int area = inter.width * inter.height;
+		if (area > best_src_area) {
+			best_src_area = area;
+			best_src_idx = i;
+		}
+	}
 
-	if((inter_src.height*inter_src.width) > (inter_dst.height*inter_dst.width))
-	{
-		// the active window overlaps more with the source screen
-		squint_show();
+	GdkRectangle inter_dst;
+	gdk_rectangle_intersect(&active_window_rect, &dst_rect, &inter_dst);
+	int dst_area = inter_dst.width * inter_dst.height;
+
+	if (best_src_area > dst_area) {
+		// active window overlaps more with a source monitor
+		if (best_src_idx >= 0 &&
+		    memcmp(&src_rects_list[best_src_idx], &src_rect, sizeof(GdkRectangle)) != 0) {
+			squint_switch_source(best_src_idx);
+		} else {
+			squint_show();
+		}
 	} else {
-		// the active window overlaps more with the destination screen
 		squint_hide();
 	}
 }
@@ -1289,4 +1316,12 @@ x11_disable()
 	x11_disable_focus_tracking();
 
 	x11_disable_window();
+}
+
+void
+x11_switch_source()
+{
+	x11_disable_window();
+	x11_enable_window();
+	XClearWindow(display, gdk_x11_window_get_xid(gdkwin));
 }

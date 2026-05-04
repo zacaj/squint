@@ -27,6 +27,10 @@ GdkDisplay* gdisplay = NULL;
 
 GdkRectangle src_rect, dst_rect, active_window_rect;
 
+GdkRectangle* src_rects_list = NULL;
+int n_src_monitors = 0;
+static GdkMonitor** src_monitors_list = NULL;
+
 static GdkMonitor* src_monitor = NULL;
 static GdkMonitor* dst_monitor = NULL;
 
@@ -536,12 +540,29 @@ resolve_monitor_number(const char** name)
 	*name = g_strdup(gdk_monitor_get_model(mon));
 }
 
+static void
+free_src_monitors_list()
+{
+	if (src_monitors_list) {
+		for (int i = 0; i < n_src_monitors; i++) {
+			if (src_monitors_list[i]) g_object_unref(src_monitors_list[i]);
+		}
+		g_free(src_monitors_list);
+		src_monitors_list = NULL;
+	}
+	g_free(src_rects_list);
+	src_rects_list = NULL;
+	n_src_monitors = 0;
+}
+
 //
 // select which monitor is going to be duplicated
 //
 // initialises:
 // 	src_rect
 // 	src_monitor
+// 	src_rects_list
+// 	n_src_monitors
 // 	dst_rect
 // 	dst_monitor
 gboolean
@@ -550,6 +571,7 @@ select_monitors()
 	int n;
 	unselect_monitor(&src_monitor, &src_rect);
 	unselect_monitor(&dst_monitor, &dst_rect);
+	free_src_monitors_list();
 
 	n = gdk_display_get_n_monitors (gdisplay);
 	if ((n < 2) && !config.src_monitor_name) {
@@ -557,11 +579,39 @@ select_monitors()
 		return FALSE;
 	}
 
-	// first we try to allocate the requested monitors
-	if (config.src_monitor_name
-		&& !select_monitor_by_name(gdisplay, config.src_monitor_name, &src_monitor, &src_rect)) {
-			return FALSE;
+	// parse comma-separated source monitor names
+	if (config.src_monitor_name) {
+		gchar** names = g_strsplit(config.src_monitor_name, ",", -1);
+		int count = g_strv_length(names);
+
+		src_monitors_list = g_new0(GdkMonitor*, count);
+		src_rects_list = g_new0(GdkRectangle, count);
+
+		for (int i = 0; i < count; i++) {
+			// own a fresh copy so resolve_monitor_number can free/replace it safely
+			gchar* name = g_strstrip(g_strdup(names[i]));
+			resolve_monitor_number((const char**)&name);
+			GdkMonitor* mon = NULL;
+			GdkRectangle rect;
+			memset(&rect, 0, sizeof(rect));
+			gboolean ok = select_monitor_by_name(gdisplay, name, &mon, &rect);
+			g_free(name);
+			if (!ok) {
+				g_strfreev(names);
+				free_src_monitors_list();
+				return FALSE;
+			}
+			src_monitors_list[n_src_monitors] = mon;
+			src_rects_list[n_src_monitors] = rect;
+			n_src_monitors++;
+		}
+		g_strfreev(names);
+
+		// set current source to the first in the list
+		src_monitor = g_object_ref(src_monitors_list[0]);
+		src_rect = src_rects_list[0];
 	}
+
 	if (config.dst_monitor_name
 		&& !select_monitor_by_name(gdisplay, config.dst_monitor_name, &dst_monitor, &dst_rect)) {
 			return FALSE;
@@ -576,6 +626,14 @@ select_monitors()
 	if (src_monitor == NULL) {
 		select_rightmost_monitor_but(gdisplay, &src_monitor, &src_rect,
 				(dst_monitor ? &dst_rect : NULL));
+		// single auto-detected source: build a 1-entry list
+		if (src_monitor) {
+			src_monitors_list = g_new(GdkMonitor*, 1);
+			src_rects_list = g_new(GdkRectangle, 1);
+			src_monitors_list[0] = g_object_ref(src_monitor);
+			src_rects_list[0] = src_rect;
+			n_src_monitors = 1;
+		}
 	}
 
 	// if the destination_monitor is not yet decided, then use the first unused monitor
@@ -589,10 +647,22 @@ select_monitors()
 	} else {
 		unselect_monitor(&src_monitor, &src_rect);
 		unselect_monitor(&dst_monitor, &dst_rect);
+		free_src_monitors_list();
 
 		squint_error("Could not find any monitor to be cloned");
 		return FALSE;
 	}
+}
+
+void
+squint_switch_source(int idx)
+{
+	g_assert(idx >= 0 && idx < n_src_monitors);
+	if (src_monitor) g_object_unref(src_monitor);
+	src_monitor = g_object_ref(src_monitors_list[idx]);
+	src_rect = src_rects_list[idx];
+	x11_switch_source();
+	squint_show();
 }
 
 //
@@ -718,7 +788,7 @@ GOptionEntry option_entries[] = {
   { "version",	'v',	0,	G_OPTION_ARG_NONE,	&config.opt_version,	"Display version information and exit", NULL},
   { "scale",	's',	0,	G_OPTION_ARG_NONE,	&config.opt_scale,	"Scale the source screen to fit the display area (requires XRender)", NULL},
   { "window",	'w',	0,	G_OPTION_ARG_NONE,	&config.opt_window,	"Run inside a window instead of going fullscreen", NULL},
-  { "src",	'S',	0,	G_OPTION_ARG_STRING,	&config.src_monitor_name,	"Source monitor name or number (see --list-monitors)", "MONITOR"},
+  { "src",	'S',	0,	G_OPTION_ARG_STRING,	&config.src_monitor_name,	"Source monitor name(s) or number(s), comma-separated (see --list-monitors)", "MONITOR[,MONITOR...]"},
   { "dst",	'D',	0,	G_OPTION_ARG_STRING,	&config.dst_monitor_name,	"Destination monitor name or number (see --list-monitors)", "MONITOR"},
   { NULL }
 };

@@ -16,7 +16,7 @@ squint - duplicate a monitor output into a X11 window
 
 = SYNOPSIS =[synopsis]
 
-**squint** [ -dvwsL ] [ -l N ] [ -r N ] [-S SourceMonitor][-D DestinationMonitor] [SourceMonitor [DestinationMonitor]]
+**squint** [ -dvwsL ] [ -l N ] [ -r N ] [-S SourceMonitor(s)][-D DestinationMonitor] [SourceMonitor(s) [DestinationMonitor]]
 
 = DESCRIPTION =[description]
 
@@ -52,7 +52,7 @@ Note: the passive mode is effective only when running in an ordinary window
 : **-r N, --rate N**
 use fixed refresh rate of N frames per second (default to 25fps when the XDamage extension is not available)
 : **-S MONITOR, --src MONITOR**
-use MONITOR as the source monitor (name or number, see --list-monitors)
+use MONITOR as the source monitor (name or number, see --list-monitors).  can be a comma separated list to switch between multiple, following user activity.
 : **-D MONITOR, --dst MONITOR**
 use MONITOR as the destination monitor (name or number, see --list-monitors)
 : **-s, --scale**
