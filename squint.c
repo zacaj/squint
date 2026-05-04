@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
+#include <unistd.h>
 
 #include <gdk-pixbuf/gdk-pixbuf.h>
 
@@ -406,15 +408,40 @@ init()
 	{
 		GError* err = NULL;
 
-		// load the icon
-		const char* icon_path = PREFIX "/share/squint/squint.png";
-		icon = gdk_pixbuf_new_from_file (icon_path, &err);
+		// Try to load the icon from the executable directory first, then fall back to PREFIX
+		char* icon_path = NULL;
+		gboolean icon_found = FALSE;
+
+		// Try loading from the same directory as the executable
+		{
+			char exe_path[PATH_MAX];
+			ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+			if (len > 0) {
+				exe_path[len] = '\0';
+				char* dir = g_path_get_dirname(exe_path);
+				icon_path = g_build_filename(dir, "squint.png", NULL);
+				if (g_file_test(icon_path, G_FILE_TEST_EXISTS)) {
+					icon_found = TRUE;
+				} else {
+					g_free(icon_path);
+				}
+				g_free(dir);
+			}
+		}
+
+		// Fall back to PREFIX path
+		if (!icon_found) {
+			icon_path = g_strdup(PREFIX "/share/squint/squint.png");
+		}
+
+		icon = gdk_pixbuf_new_from_file(icon_path, &err);
 		if (!icon)
 		{
 			squint_error(err->message);
-			g_clear_error (&err);
+			g_clear_error(&err);
 		}
 		gicon = g_file_icon_new(g_file_new_for_path(icon_path));
+		g_free(icon_path);
 	}
 	cursor_icon = gdk_cursor_new_for_display(gdisplay, GDK_X_CURSOR);
 
