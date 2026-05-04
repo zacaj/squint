@@ -1321,7 +1321,13 @@ x11_disable()
 void
 x11_switch_source()
 {
+#ifdef COPY_CURSOR
+	x11_disable_copy_cursor();
+#endif
 	x11_disable_window();
 	x11_enable_window();
+#ifdef COPY_CURSOR
+	x11_enable_copy_cursor();
+#endif
 	XClearWindow(display, gdk_x11_window_get_xid(gdkwin));
 }
