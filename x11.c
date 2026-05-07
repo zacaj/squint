@@ -92,6 +92,8 @@ gboolean x11_draw_cursor();
 gboolean x11_clear_cursor();
 void x11_redraw_cursor(gboolean do_clear);
 
+static gboolean inhibit_source_switch = FALSE;
+
 #ifdef HAVE_XRENDER
 static void
 x11_update_scale(int dst_w, int dst_h)
@@ -211,8 +213,10 @@ x11_refresh_cursor_location(gboolean force)
 
 	// switch source if the cursor moved to a different listed monitor
 	if (memcmp(&src_rects_list[found_idx], &src_rect, sizeof(GdkRectangle)) != 0) {
-		squint_switch_source(found_idx);
-		// x11_enable_window() called by squint_switch_source will re-call us
+		if (!inhibit_source_switch) {
+			squint_switch_source(found_idx);
+			// x11_enable_window() called by squint_switch_source will re-call us
+		}
 		return;
 	}
 
@@ -589,9 +593,6 @@ x11_active_window_start_monitoring()
 	if (active_window)
 		x11_active_window_stop_monitoring();
 
-	if (config.opt_passive)
-		return;
-
 	active_window = x11_get_active_window();
 	if (!active_window)
 		return;
@@ -605,12 +606,16 @@ x11_active_window_start_monitoring()
 		return;
 	}
 
+	// in passive mode, only track focus changes, not window geometry changes
+	if (config.opt_passive)
+		return;
+
 	if (!gdk_x11_window_lookup_for_display(gdisplay, active_window))
 	{
 		// this is a foreign window
 		// -> we need to monitor it explicitely
-		
-		 
+
+
 		// ignore X11 errors (this function can produce BadWindow errors since
 		// it makes queries on windows controlled by other applications)
 		gdk_x11_display_error_trap_push(gdisplay);
@@ -634,8 +639,29 @@ x11_on_x11_event (GdkXEvent *xevent, GdkEvent *event, gpointer data)
 		if ((pn_ev->window == root_window) && (pn_ev->atom == net_active_window_atom))
 		{
 			// property _NET_ACTIVE_WINDOW was changed
+			GdkRectangle prev_src = src_rect;
+			GdkPoint prev_cursor = cursor;
 			x11_active_window_start_monitoring();
 			x11_show_active_window();
+
+			if (config.opt_warp_cursor &&
+			    memcmp(&prev_src, &src_rect, sizeof(GdkRectangle)) != 0 &&
+			    prev_cursor.x >= 0 && prev_src.width > 0 && prev_src.height > 0)
+			{
+				// Focus switched to a window on a different source monitor.
+				// Preserve the same fractional position within the squint window:
+				// cursor.x/y is relative to the source rect, so normalize against
+				// the old source dimensions and map to the new source.
+				float rel_x = (float)prev_cursor.x / prev_src.width;
+				float rel_y = (float)prev_cursor.y / prev_src.height;
+				int tx = src_rect.x + (int)(rel_x * src_rect.width);
+				int ty = src_rect.y + (int)(rel_y * src_rect.height);
+				tx = CLAMP(tx, src_rect.x, src_rect.x + src_rect.width  - 1);
+				ty = CLAMP(ty, src_rect.y, src_rect.y + src_rect.height - 1);
+				XWarpPointer(display, None, root_window, 0, 0, 0, 0, tx, ty);
+				XFlush(display);
+			}
+
 			return GDK_FILTER_REMOVE;
 		}
 		
@@ -1190,8 +1216,11 @@ x11_enable_window()
 	backup_pixmap = XCreatePixmap(display, root_window,
 				CURSOR_SIZE, CURSOR_SIZE, 24);
 
-	// force refreshing the cursor position
+	// force refreshing the cursor position without switching sources
+	// (source switches from x11_enable_window would undo focus-based switches)
+	inhibit_source_switch = TRUE;
 	x11_refresh_cursor_location(TRUE);
+	inhibit_source_switch = FALSE;
 }
 
 void
@@ -1221,9 +1250,6 @@ void
 x11_enable_focus_tracking()
 {
 	memset(&active_window_rect, 0, sizeof(active_window_rect));
-
-	if (config.opt_passive)
-		return;
 
 	XSetWindowAttributes attr;
 	attr.event_mask = PropertyChangeMask;

@@ -810,6 +810,7 @@ GOptionEntry option_entries[] = {
   { "disable",	'd',	0,	G_OPTION_ARG_NONE,	&config.opt_disable,	"Do not enable screen duplication at startup", NULL},
   { "limit",	'l',	0,	G_OPTION_ARG_INT,	&config.opt_limit,	"Limit refresh rate to N frames per second", "N"},
   { "list-monitors",	'L',	0,	G_OPTION_ARG_NONE,	&config.opt_list_monitors,	"Print a numbered list of available monitors and exit", NULL},
+  { "no-warp-cursor",	0,	0,	G_OPTION_ARG_NONE,	&config.opt_warp_cursor,	"Do not warp cursor on focus change to different monitor", NULL},
   { "passive",	'p',	0,	G_OPTION_ARG_NONE,	&config.opt_passive,	"Do not raise the window on user activity (has no effects in fullscreen mode)", NULL},
   { "rate",	'r',	0,	G_OPTION_ARG_INT,	&config.opt_rate,	"Use fixed refresh rate of N frames per second", "N"},
   { "version",	'v',	0,	G_OPTION_ARG_NONE,	&config.opt_version,	"Display version information and exit", NULL},
@@ -847,6 +848,7 @@ main (int argc, char *argv[])
 
 	memset(&config, 0, sizeof(config));
 	config.opt_limit = -1;
+	config.opt_warp_cursor = TRUE;
 
 	context = g_option_context_new (NULL);
 	g_option_context_add_main_entries (context, option_entries, NULL);
