@@ -818,6 +818,7 @@ GOptionEntry option_entries[] = {
   { "window",	'w',	0,	G_OPTION_ARG_NONE,	&config.opt_window,	"Run inside a window instead of going fullscreen", NULL},
   { "src",	'S',	0,	G_OPTION_ARG_STRING,	&config.src_monitor_name,	"Source monitor name(s) or number(s), comma-separated (see --list-monitors)", "MONITOR[,MONITOR...]"},
   { "dst",	'D',	0,	G_OPTION_ARG_STRING,	&config.dst_monitor_name,	"Destination monitor name or number (see --list-monitors)", "MONITOR"},
+  { "switch-threshold",	'T',	0,	G_OPTION_ARG_INT,	&config.opt_switch_threshold,	"Pixels cursor must travel into a new monitor before switching (default 100, 0 to disable)", "N"},
   { NULL }
 };
 
@@ -849,6 +850,7 @@ main (int argc, char *argv[])
 	memset(&config, 0, sizeof(config));
 	config.opt_limit = -1;
 	config.opt_warp_cursor = TRUE;
+	config.opt_switch_threshold = 75;
 
 	context = g_option_context_new (NULL);
 	g_option_context_add_main_entries (context, option_entries, NULL);

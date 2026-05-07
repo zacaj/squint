@@ -9,7 +9,7 @@ extern struct config {
 	const char* dst_monitor_name;
 
 	gboolean opt_version, opt_window, opt_disable, opt_passive, opt_scale, opt_list_monitors, opt_warp_cursor;
-	gint opt_limit, opt_rate;
+	gint opt_limit, opt_rate, opt_switch_threshold;
 } config;
 
 

@@ -93,6 +93,8 @@ gboolean x11_clear_cursor();
 void x11_redraw_cursor(gboolean do_clear);
 
 static gboolean inhibit_source_switch = FALSE;
+static int pending_switch_idx = -1;
+static GdkPoint switch_entry_point;
 
 #ifdef HAVE_XRENDER
 static void
@@ -214,11 +216,27 @@ x11_refresh_cursor_location(gboolean force)
 	// switch source if the cursor moved to a different listed monitor
 	if (memcmp(&src_rects_list[found_idx], &src_rect, sizeof(GdkRectangle)) != 0) {
 		if (!inhibit_source_switch) {
-			squint_switch_source(found_idx);
-			// x11_enable_window() called by squint_switch_source will re-call us
+			int threshold = config.opt_switch_threshold;
+			if (threshold <= 0) {
+				pending_switch_idx = -1;
+				squint_switch_source(found_idx);
+			} else {
+				if (pending_switch_idx != found_idx) {
+					pending_switch_idx = found_idx;
+					switch_entry_point = c;
+				} else {
+					int dx = abs(c.x - switch_entry_point.x);
+					int dy = abs(c.y - switch_entry_point.y);
+					if ((dx >= threshold) || (dy >= threshold)) {
+						pending_switch_idx = -1;
+						squint_switch_source(found_idx);
+					}
+				}
+			}
 		}
 		return;
 	}
+	pending_switch_idx = -1;
 
 	c.x -= src_rect.x;
 	c.y -= src_rect.y;
