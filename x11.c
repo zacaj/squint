@@ -503,7 +503,9 @@ x11_show_active_window()
 			squint_show();
 		}
 	} else {
+		if (!config.opt_passive) {
 		squint_hide();
+		}
 	}
 }
 
