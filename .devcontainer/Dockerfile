@@ -20,3 +20,7 @@ RUN dnf install -y \
     txt2tags \
     gzip \
     && dnf clean all
+
+
+RUN useradd -m node 
+USER node
