@@ -95,6 +95,7 @@ void x11_redraw_cursor(gboolean do_clear);
 static gboolean inhibit_source_switch = FALSE;
 static int pending_switch_idx = -1;
 static GdkPoint switch_entry_point;
+static gboolean alt_pressed = FALSE;
 
 #ifdef HAVE_XRENDER
 static void
@@ -504,7 +505,7 @@ x11_show_active_window()
 		}
 	} else {
 		if (!config.opt_passive) {
-		squint_hide();
+			squint_hide();
 		}
 	}
 }
@@ -664,11 +665,11 @@ x11_on_x11_event (GdkXEvent *xevent, GdkEvent *event, gpointer data)
 			x11_active_window_start_monitoring();
 			x11_show_active_window();
 
-			if (config.opt_warp_cursor &&
+			if (config.opt_warp_cursor && alt_pressed &&
 			    memcmp(&prev_src, &src_rect, sizeof(GdkRectangle)) != 0 &&
 			    prev_cursor.x >= 0 && prev_src.width > 0 && prev_src.height > 0)
 			{
-				// Focus switched to a window on a different source monitor.
+				// Focus switched to a window on a different source monitor during Alt+Tab.
 				// Preserve the same fractional position within the squint window:
 				// cursor.x/y is relative to the source rect, so normalize against
 				// the old source dimensions and map to the new source.
@@ -727,21 +728,45 @@ x11_on_x11_event (GdkXEvent *xevent, GdkEvent *event, gpointer data)
 					{
 						switch(keyval)
 						{
+						case  GDK_KEY_Alt_L:
+						case  GDK_KEY_Alt_R:
+							alt_pressed = TRUE;
+							return GDK_FILTER_REMOVE;
 						case  GDK_KEY_Control_L:
 						case  GDK_KEY_Control_R:
 						case  GDK_KEY_Meta_L:
 						case  GDK_KEY_Meta_R:
-						case  GDK_KEY_Alt_L:
-						case  GDK_KEY_Alt_R:
 							// ignore modifier keys (except shift)
 							// because they may be used by the
 							// window manager
 							return GDK_FILTER_REMOVE;
 						}
 					}
-				
+
 					x11_show_active_window();
 					return GDK_FILTER_REMOVE;
+				}
+			case XI_RawKeyRelease:
+				// a key was released
+				{
+					XIRawEvent* xi_ev = (XIRawEvent*) cookie->data;
+					GdkKeymap* km = gdk_keymap_get_for_display(gdisplay);
+					guint keyval;
+
+					if(gdk_keymap_translate_keyboard_state(km, xi_ev->detail,
+							0, // FIXME: do we need the modifier?
+							0, // FIXME: how to determine the group?
+							&keyval, NULL, NULL, NULL))
+					{
+						switch(keyval)
+						{
+						case  GDK_KEY_Alt_L:
+						case  GDK_KEY_Alt_R:
+							alt_pressed = FALSE;
+							return GDK_FILTER_REMOVE;
+						}
+					}
+					return GDK_FILTER_CONTINUE;
 				}
 			}
 		}
@@ -819,6 +844,7 @@ x11_set_xi_eventmask(gboolean active)
 		XISetMask(mask1, XI_RawMotion);
 		if (!config.opt_passive) {
 			XISetMask(mask1, XI_RawKeyPress);
+			XISetMask(mask1, XI_RawKeyRelease);
 		}
 	}
 
