@@ -1,0 +1,24 @@
+# Allow the iGPU :1 Xorg server to start without a password, so it can be
+# launched unattended by squint-igpu-server.service at desktop login.
+#
+# Why root is needed at all: /dev/dri/card1 (the Intel iGPU) is root:video 0660
+# with no ACL, because 99-igpu-seat1.rules deliberately strips the "uaccess" tag
+# to keep logind from handing the iGPU to the seat0 session. :0's Xorg runs
+# unprivileged only because logind does grant it an ACL on card0.
+#
+# The rule matches this one exact command line and nothing else. Colons must be
+# escaped in sudoers command arguments. Keep it in sync with the ExecStart line
+# in ~/.config/systemd/user/squint-igpu-server.service -- an argument mismatch
+# makes sudo fall through to a password prompt, which fails silently at login.
+#
+# Note: -configdir points at a user-writable directory, so write access to
+# tools/xorg-igpu.conf.d/ implies root code execution via an Xorg module. That
+# is not a new privilege boundary for a user already in wheel, but it does mean
+# this rule is only as tight as that directory's permissions.
+#
+# Install:
+#   sudo install -m 0440 -o root -g root \
+#       ~/src/squint/tools/squint-igpu.sudoers /etc/sudoers.d/squint-igpu
+#   sudo visudo -c
+
+zacaj ALL=(root) NOPASSWD: /usr/bin/Xorg \:1 -configdir /var/home/zacaj/src/squint/tools/xorg-igpu.conf.d -layout iGPULayout -logfile /var/home/zacaj/.local/share/xorg/Xorg.1.log -auth /tmp/xauth-igpu -sharevts -novtswitch -isolateDevice PCI\:0\:2\:0

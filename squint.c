@@ -26,6 +26,10 @@ gboolean raised = FALSE;
 GtkWidget* gtkwin = NULL;
 GdkWindow* gdkwin = NULL;
 GdkDisplay* gdisplay = NULL;
+// In cross-server mode, monitor names/numbers for -S must resolve against
+// the source display, not gdisplay (which is the destination display).
+// Aliases gdisplay when source and destination are the same server.
+static GdkDisplay* src_gdisplay = NULL;
 
 GdkRectangle src_rect, dst_rect, active_window_rect;
 
@@ -85,6 +89,8 @@ squint_error(const char* msg)
 	}
 }
 
+static gboolean reposition_timeout_cb(gpointer data);
+
 void
 squint_show()
 {
@@ -93,6 +99,9 @@ squint_show()
 		raised = TRUE;
 		if (fullscreen) {
 			gtk_widget_show(gtkwin);
+			// Pin the window to its destination monitor. Moving right after
+			// show is overridden by GTK's post-map configure, so defer it.
+			g_timeout_add(100, reposition_timeout_cb, NULL);
 		} else if (!config.opt_passive) {
 			gdk_window_raise(gdkwin);
 		}
@@ -138,9 +147,26 @@ on_window_button_press_event(GtkWidget* widget, GdkEvent* event, gpointer data)
 gboolean
 on_window_delete_event(GtkWidget* widget, GdkEvent* event, gpointer data)
 {
-	squint_disable();
+	squint_disable("window closed");
 	return TRUE;
 }
+
+// Re-apply the destination position whenever the fullscreen window is mapped.
+// With no window manager on the destination display, mapping an
+// override-redirect GTK_WINDOW_POPUP (which happens on every show, e.g. when
+// the cursor-follow logic reveals the mirror) drops it back to 0,0. A mirror
+// whose monitor origin is non-zero (e.g. HDMI-1 at 3840,0) would otherwise
+// jump onto the primary output. map-event fires after the X map, so the move
+// sticks (unlike a move issued right after gtk_widget_show).
+static gboolean
+reposition_timeout_cb(gpointer data)
+{
+	if (fullscreen && gdkwin) {
+		x11_reposition_window(gdkwin, dst_rect.x, dst_rect.y);
+	}
+	return G_SOURCE_REMOVE;   // one-shot
+}
+
 
 #define ITEM_MASK		0xffffff00
 #define ITEM_ENABLE		(1<<8)
@@ -180,7 +206,7 @@ on_menu_item_activate(gpointer pointer, gpointer user_data)
 	{
 	case ITEM_ENABLE:
 		if (enabled) {
-			squint_disable();
+			squint_disable("menu: disabled by user");
 		} else {
 			squint_enable();
 		}
@@ -213,7 +239,7 @@ on_menu_item_activate(gpointer pointer, gpointer user_data)
 	return;
 reset:
 	if (enabled) {
-		squint_disable();
+		squint_disable("config changed via menu");
 		squint_enable();
 	} else {
 		refresh_app_indicator();
@@ -394,6 +420,15 @@ refresh_app_indicator()
 gboolean
 init()
 {
+	// main() calls init() twice: once early (so --list-monitors has a
+	// display to query before parsing positional args) and once after
+	// positional-arg parsing. Guard against running the body twice --
+	// otherwise x11_init() creates a second source pixmap/DRI3 export
+	// that's never used, which the destination DRI3 export can fail on.
+	static gboolean initialized = FALSE;
+	if (initialized) return TRUE;
+	initialized = TRUE;
+
 	gtkapp = G_APPLICATION(gtk_application_new("org.github.a-ba.squint",
 				G_APPLICATION_NON_UNIQUE));
 	g_application_hold(gtkapp);
@@ -443,7 +478,15 @@ init()
 		gicon = g_file_icon_new(g_file_new_for_path(icon_path));
 		g_free(icon_path);
 	}
-	cursor_icon = gdk_cursor_new_for_display(gdisplay, GDK_X_CURSOR);
+	// In cross-server mode the destination server (:1) has its own hardware
+	// pointer, which would draw a second cursor on top of the mirror (we
+	// already composite the source cursor into the image). Use a blank cursor
+	// over the mirror window so only the composited source cursor shows. In
+	// single-server mode keep the visible X cursor as before.
+	gboolean cross_server = config.src_display_name && config.dst_display_name
+		&& strcmp(config.src_display_name, config.dst_display_name) != 0;
+	cursor_icon = gdk_cursor_new_for_display(gdisplay,
+			cross_server ? GDK_BLANK_CURSOR : GDK_X_CURSOR);
 
 	gboolean result = x11_init();
 
@@ -549,20 +592,20 @@ select_any_monitor_but(GdkDisplay* dsp, GdkMonitor** mon, GdkRectangle* rect, co
 
 // If *name is a positive integer string, replace it with the name of that monitor (1-based).
 static void
-resolve_monitor_number(const char** name)
+resolve_monitor_number(GdkDisplay* dsp, const char** name)
 {
 	if (!*name) return;
 	char* end;
 	long idx = strtol(*name, &end, 10);
 	if (*end != '\0' || idx < 1) return; // not a plain integer
-	int n = gdk_display_get_n_monitors(gdisplay);
+	int n = gdk_display_get_n_monitors(dsp);
 	if (idx > n) {
 		char buff[64];
 		g_snprintf(buff, sizeof(buff), "Monitor number %ld is out of range (1-%d)", idx, n);
 		squint_error(buff);
 		return;
 	}
-	GdkMonitor* mon = gdk_display_get_monitor(gdisplay, (int)(idx - 1));
+	GdkMonitor* mon = gdk_display_get_monitor(dsp, (int)(idx - 1));
 	g_free((gpointer)*name);
 	*name = g_strdup(gdk_monitor_get_model(mon));
 }
@@ -617,11 +660,11 @@ select_monitors()
 		for (int i = 0; i < count; i++) {
 			// own a fresh copy so resolve_monitor_number can free/replace it safely
 			gchar* name = g_strstrip(g_strdup(names[i]));
-			resolve_monitor_number((const char**)&name);
+			resolve_monitor_number(src_gdisplay, (const char**)&name);
 			GdkMonitor* mon = NULL;
 			GdkRectangle rect;
 			memset(&rect, 0, sizeof(rect));
-			gboolean ok = select_monitor_by_name(gdisplay, name, &mon, &rect);
+			gboolean ok = select_monitor_by_name(src_gdisplay, name, &mon, &rect);
 			g_free(name);
 			if (!ok) {
 				g_strfreev(names);
@@ -761,6 +804,15 @@ enable_window()
 
 	// hide the window for the moment
 	do_hide();
+
+	// Passive fullscreen mirrors are always-on: show the window now instead of
+	// waiting for the cursor-follow logic to reveal it. In cross-server mode
+	// that logic tracks the destination server's pointer, which never matches
+	// the source monitor coordinates, so the window would otherwise stay hidden
+	// forever. (Passive mode also means it is never auto-hidden again.)
+	if (fullscreen && config.opt_passive) {
+		squint_show();
+	}
 }
 
 void
@@ -792,8 +844,10 @@ squint_enable()
 }
 
 void
-squint_disable()
+squint_disable(const char* reason)
 {
+	fprintf(stderr, "squint: disabling (%s)\n", reason);
+
 	enabled = FALSE;
 
 	x11_disable();
@@ -812,6 +866,7 @@ GOptionEntry option_entries[] = {
   { "list-monitors",	'L',	0,	G_OPTION_ARG_NONE,	&config.opt_list_monitors,	"Print a numbered list of available monitors and exit", NULL},
   { "no-warp-cursor",	0,	0,	G_OPTION_ARG_NONE,	&config.opt_warp_cursor,	"Do not warp cursor on focus change to different monitor", NULL},
   { "passive",	'p',	0,	G_OPTION_ARG_NONE,	&config.opt_passive,	"Do not raise the window on user activity (has no effects in fullscreen mode)", NULL},
+  { "perf-log",	0,	0,	G_OPTION_ARG_NONE,	&config.opt_perf_log,	"Periodically print per-stage frame timing (cursor/capture/export/draw/swap) to stderr", NULL},
   { "rate",	'r',	0,	G_OPTION_ARG_INT,	&config.opt_rate,	"Use fixed refresh rate of N frames per second", "N"},
   { "version",	'v',	0,	G_OPTION_ARG_NONE,	&config.opt_version,	"Display version information and exit", NULL},
   { "scale",	's',	0,	G_OPTION_ARG_NONE,	&config.opt_scale,	"Scale the source screen to fit the display area (requires XRender)", NULL},
@@ -819,6 +874,8 @@ GOptionEntry option_entries[] = {
   { "src",	'S',	0,	G_OPTION_ARG_STRING,	&config.src_monitor_name,	"Source monitor name(s) or number(s), comma-separated (see --list-monitors)", "MONITOR[,MONITOR...]"},
   { "dst",	'D',	0,	G_OPTION_ARG_STRING,	&config.dst_monitor_name,	"Destination monitor name or number (see --list-monitors)", "MONITOR"},
   { "switch-threshold",	'T',	0,	G_OPTION_ARG_INT,	&config.opt_switch_threshold,	"Pixels cursor must travel into a new monitor before switching (default 100, 0 to disable)", "N"},
+  { "src-display",	0,	0,	G_OPTION_ARG_STRING,	&config.src_display_name,	"X11 display for source (default: $DISPLAY)", "DISPLAY"},
+  { "dst-display",	0,	0,	G_OPTION_ARG_STRING,	&config.dst_display_name,	"X11 display for mirror window (default: same as source)", "DISPLAY"},
   { NULL }
 };
 
@@ -852,6 +909,25 @@ main (int argc, char *argv[])
 	config.opt_warp_cursor = TRUE;
 	config.opt_switch_threshold = 75;
 
+	// Pre-scan argv for --dst-display before gtk_init (so GDK connects to correct display)
+	for (int i = 1; i < argc - 1; i++) {
+		if (strcmp(argv[i], "--dst-display") == 0) {
+			config.dst_display_name = argv[i + 1];
+			break;
+		}
+	}
+
+	// Open destination GDK display BEFORE gtk_init if cross-server
+	if (config.dst_display_name) {
+		gdisplay = gdk_display_open(config.dst_display_name);
+		if (!gdisplay) {
+			char msg[256];
+			snprintf(msg, sizeof(msg), "Cannot open destination display %s", config.dst_display_name);
+			fprintf(stderr, "error: %s\n", msg);
+			return 1;
+		}
+	}
+
 	context = g_option_context_new (NULL);
 	g_option_context_add_main_entries (context, option_entries, NULL);
 	g_option_context_add_group (context, gtk_get_option_group (TRUE));
@@ -863,6 +939,11 @@ main (int argc, char *argv[])
 	}
 
 	g_option_context_free(context);
+
+	// Set default display if not already set
+	if (!gdisplay) {
+		gdisplay = gdk_display_get_default();
+	}
 
 	if (config.opt_version) {
 		puts(APPNAME " " VERSION);
@@ -902,9 +983,24 @@ main (int argc, char *argv[])
 		return 1;
 	}
 
-	// Resolve numeric monitor specs now that gdisplay is available
-	resolve_monitor_number(&config.src_monitor_name);
-	resolve_monitor_number(&config.dst_monitor_name);
+	// Cross-server mode: resolve source monitor names/numbers against the
+	// source display, not gdisplay (which is the destination display there).
+	if (config.src_display_name &&
+		(!config.dst_display_name || strcmp(config.src_display_name, config.dst_display_name) != 0)) {
+		src_gdisplay = gdk_display_open(config.src_display_name);
+		if (!src_gdisplay) {
+			char msg[256];
+			snprintf(msg, sizeof(msg), "Cannot open source display %s", config.src_display_name);
+			squint_error(msg);
+			return 1;
+		}
+	} else {
+		src_gdisplay = gdisplay;
+	}
+
+	// Resolve numeric monitor specs now that gdisplay/src_gdisplay are available
+	resolve_monitor_number(src_gdisplay, &config.src_monitor_name);
+	resolve_monitor_number(gdisplay, &config.dst_monitor_name);
 
 	// activation
 	if (!config.opt_disable) {

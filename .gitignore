@@ -1,3 +1,4 @@
 .*.sw[op]
 /bld
 squint.1.html
+.claude/settings.local.json

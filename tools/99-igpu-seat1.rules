@@ -1,0 +1,9 @@
+# Assign the Intel iGPU (PCI 00:02.0) and its DRM/render nodes to seat1.
+# This prevents logind from granting the user's seat0 session ACL access to
+# the Intel GPU, freeing it for a standalone Xorg :1 (see igpu-server-up.sh).
+#
+# Install: sudo cp to /etc/udev/rules.d/
+# Activate: reboot (or sudo udevadm trigger + logout/login)
+
+# Match all DRM subnodes under the Intel iGPU's PCI device
+ACTION=="add|change", SUBSYSTEM=="drm", DEVPATH=="*/0000:00:02.0/drm/*", TAG-="seat", TAG-="uaccess", TAG-="master-of-seat", ENV{ID_SEAT}="seat1"

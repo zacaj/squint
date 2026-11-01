@@ -8,6 +8,12 @@ cfg.set_quoted('PREFIX', get_option('prefix'))
 deps = [
 	dependency('gtk+-3.0'),
 	dependency('x11'),
+	dependency('x11-xcb'),
+	dependency('xcb'),
+	dependency('egl'),
+	dependency('gl'),
+	dependency('epoxy'),
+	dependency('xcb-dri3'),
 ]
 
 have_all_deps = true
@@ -38,7 +44,7 @@ endif
 
 configure_file(configuration: cfg, output: 'config.h')
 
-executable('squint', 'squint.c', 'x11.c', dependencies: deps, install: true)
+executable('squint', 'squint.c', 'x11.c', 'egl.c', dependencies: deps, install: true)
 install_data('squint.png')
 install_data('squint-disabled.png')
 install_data('squint.desktop', install_dir: get_option('datadir') + '/applications')

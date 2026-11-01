@@ -16,9 +16,16 @@ RUN dnf install -y \
     libXi-devel \
     libXrandr-devel \
     libXrender-devel \
+    libXext-devel \
     # Man page generation (optional)
     txt2tags \
     gzip \
+    # DRI3/DMA-BUF + EGL for cross-GPU testing (libX11-devel already covers Xlib-xcb.h)
+    libxcb-devel \
+    mesa-libEGL-devel \
+    mesa-libGL-devel \
+    # Nested X server for cross-server testing
+    xorg-x11-server-Xephyr \
     && dnf clean all
 
 

@@ -1,12 +1,20 @@
 #include "config.h"
 
 #include <stdint.h>
+#include <unistd.h>
+#include <dlfcn.h>
 
 #include <gdk/gdkx.h>
 
 #include "squint.h"
 
 #include <X11/Xlib.h>
+#include <X11/Xlib-xcb.h>
+#include <xcb/xcb.h>
+#include <xcb/dri3.h>
+#include <xcb/sync.h>
+#include <libdrm/drm_fourcc.h>
+#include "egl.h"
 #ifdef HAVE_XI
 #include <X11/extensions/XInput2.h>
 #endif
@@ -25,6 +33,10 @@
 
 static Window root_window = 0;
 static GdkRectangle root_window_rect;
+// Source-screen counterpart to root_window_rect, for the cross-server
+// active-window poll (see x11_refresh_active_window_cross_server): comparing
+// a :0 window's geometry against :1's screen size would be meaningless.
+static GdkRectangle src_root_window_rect;
 static Window window = 0;
 static Pixmap pixmap = -1;
 static int depth = -1, screen = -1;
@@ -33,6 +45,9 @@ static GC gc_white = NULL;
 static Display* display = NULL;
 static gint refresh_timer = 0;
 static Atom net_active_window_atom = 0;
+// _NET_ACTIVE_WINDOW interned on src_display -- atom values are per-connection,
+// so the destination-server atom above cannot be reused for source queries.
+static Atom net_active_window_atom_src = 0;
 
 static GdkPoint backup;
 static Pixmap   backup_pixmap = 0;
@@ -75,10 +90,25 @@ static int cursor_xhot=0;
 static int cursor_yhot=0;
 static uint32_t* cursor_pixels;
 #define CURSOR_PIXELS_SIZE (sizeof(*cursor_pixels) * CURSOR_SIZE * CURSOR_SIZE)
+
+// Cross-server cursor overlay: the EGL path renders straight from the source
+// pixmap, so the destination-side COPY_CURSOR compositing never appears. Here
+// we instead bake the SOURCE (:0) cursor into src_pixmap each frame (after the
+// XCopyArea, before the DRI3 export) using XRender on the source display. The
+// next frame's XCopyArea wipes it, so there are no trails. All resources live
+// on src_display.
+static gboolean src_cursor_avail = FALSE;     // XFixes+XRender present on src
+static Pixmap   src_cursor_pixmap = 0;        // ARGB32 scratch for the cursor image
+static Picture  src_cursor_picture = 0;
+static GC       src_cursor_gc = 0;
+static XImage*  src_cursor_ximage = NULL;
+static uint32_t* src_cursor_pixels = NULL;
+static Picture  src_pixmap_picture = 0;       // RGB24 Picture wrapping src_pixmap
 #endif
 
 #ifdef HAVE_XRANDR
 static int xrandr_event_base = 0;
+static char* x11_describe_randr_outputs(Display* dpy);
 #endif
 
 #ifdef HAVE_XRENDER
@@ -92,10 +122,38 @@ gboolean x11_draw_cursor();
 gboolean x11_clear_cursor();
 void x11_redraw_cursor(gboolean do_clear);
 
+#ifdef COPY_CURSOR
+// Cross-server source-cursor overlay (defined after the COPY_CURSOR block)
+static void x11_init_source_cursor(void);
+static void x11_composite_source_cursor(void);
+#endif
+
+// Forward declaration for DRI3 export function
+static int dri3_export_pixmap(xcb_connection_t* conn, xcb_pixmap_t pixmap,
+                              int width, int height, uint32_t* drm_format,
+                              int* stride, uint64_t* modifier);
+
 static gboolean inhibit_source_switch = FALSE;
 static int pending_switch_idx = -1;
 static GdkPoint switch_entry_point;
 static gboolean alt_pressed = FALSE;
+
+// Cross-server support (Phase 1)
+static Display* src_display = NULL;  // source X11 display (if cross-server mode)
+static xcb_connection_t* src_xcb = NULL;  // XCB connection for source (for future DRI3)
+static gboolean use_cross_server = FALSE;  // TRUE if src != dst display
+static Pixmap src_pixmap = 0;  // source pixmap for DRI3 export
+
+// DRI3 and EGL state for cross-GPU rendering
+static gboolean dri3_available = FALSE;
+static egl_context_t* egl_ctx = NULL;
+static GLuint egl_texture = 0;
+static int last_export_fd = -1;
+
+// Frame count since process start, incremented on every completed
+// x11_refresh_image(). Read by the heartbeat log so a mirror that's gone
+// quiet can be told apart from one that's just idling (no damage events).
+static unsigned long frame_counter = 0;
 
 #ifdef HAVE_XRENDER
 static void
@@ -185,6 +243,20 @@ x11_fix_offset()
 }
 
 
+// Move a destination GdkWindow using a raw XMoveWindow on its X window,
+// bypassing GTK/GDK window-geometry management. On a WM-less destination
+// display GTK keeps resetting an override-redirect popup to 0,0 on map, and
+// gtk_window_move/gdk_window_move don't reliably override that -- but a direct
+// XMoveWindow does (and nothing moves it back without a WM).
+void
+x11_reposition_window(GdkWindow* win, int x, int y)
+{
+	if (!win) return;
+	Display* d = gdk_x11_display_get_xdisplay(gdk_window_get_display(win));
+	XMoveWindow(d, gdk_x11_window_get_xid(win), x, y);
+	XFlush(d);
+}
+
 void
 x11_refresh_cursor_location(gboolean force)
 {
@@ -192,7 +264,15 @@ x11_refresh_cursor_location(gboolean force)
 	int wx, wy;
 	unsigned int mask;
 	GdkPoint c;
-	XQueryPointer(display, root_window, &root_return, &w,
+	// In cross-server mode the source-monitor rectangles (src_rects_list) are
+	// in the SOURCE display's coordinate space, so the pointer must be queried
+	// from the source server. Querying the destination (`display`) pointer --
+	// as the single-server path does -- would compare :1 coordinates against
+	// :0 rectangles and follow the wrong cursor entirely.
+	Display* q_display = (use_cross_server && src_display) ? src_display : display;
+	Window   q_root    = (use_cross_server && src_display)
+	                       ? XDefaultRootWindow(src_display) : root_window;
+	XQueryPointer(q_display, q_root, &root_return, &w,
 			&c.x, &c.y, &wx, &wy, &mask);
 
 	// check which (if any) listed source monitor contains the cursor
@@ -253,23 +333,231 @@ x11_refresh_cursor_location(gboolean force)
 	}
 }
 
+#ifdef HAVE_MIT_SHM
+#include <X11/extensions/XShm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
+static gboolean
+x11_refresh_image_shm_fallback(Display* src_dpy, const GdkRectangle* damaged_rect)
+{
+	// Fallback for Xephyr and systems without DRI3
+	// Read from source pixmap, write to destination window via XShm
+
+	if (!pixmap || !window || !src_dpy) return FALSE;
+
+	XImage* img = XGetImage(src_dpy, pixmap,
+		damaged_rect->x - src_rect.x, damaged_rect->y - src_rect.y,
+		damaged_rect->width, damaged_rect->height,
+		AllPlanes, ZPixmap);
+
+	if (!img) return FALSE;
+
+	// Write to destination window
+	GC dst_gc = gdk_x11_get_default_xlib_gc_for_colormap(
+		gdk_window_get_colormap(gdkwin));
+
+	XPutImage(display, window, dst_gc, img,
+		0, 0,
+		damaged_rect->x - src_rect.x, damaged_rect->y - src_rect.y,
+		damaged_rect->width, damaged_rect->height);
+
+	XDestroyImage(img);
+	return TRUE;
+}
+#endif
+
+// --- Optional per-stage frame timing (config.opt_perf_log) -----------------
+// Times each stage of the capture/render pipeline and prints a min/avg/max
+// summary every ~2s. Deliberately NOT per-frame -- a per-frame debug log was
+// removed earlier for spamming the output; this aggregates instead.
+typedef struct { gdouble sum_us, min_us, max_us; } perf_stat_t;
+
+static perf_stat_t perf_cursor, perf_capture, perf_export, perf_draw, perf_swap, perf_total;
+static guint perf_frames = 0;
+static gint64 perf_window_start = 0;
+
+static void
+perf_stat_reset(perf_stat_t* s)
+{
+	s->sum_us = 0;
+	s->min_us = -1;
+	s->max_us = 0;
+}
+
+static void
+perf_stat_add(perf_stat_t* s, gdouble us)
+{
+	s->sum_us += us;
+	if (s->min_us < 0 || us < s->min_us) s->min_us = us;
+	if (us > s->max_us) s->max_us = us;
+}
+
+static void
+perf_stat_report(const perf_stat_t* s, const char* name, guint frames)
+{
+	fprintf(stderr, "  %-7s avg=%6.2fms min=%6.2fms max=%6.2fms\n",
+			name, s->sum_us / frames / 1000.0, s->min_us / 1000.0, s->max_us / 1000.0);
+}
+
+// Call once at the very start of a frame, and once at the end with the
+// stage durations (in microseconds; pass 0 for stages that weren't run).
+static void
+x11_perf_frame(gdouble cursor_us, gdouble capture_us, gdouble export_us,
+				gdouble draw_us, gdouble swap_us, gdouble total_us)
+{
+	gint64 now = g_get_monotonic_time();
+
+	if (perf_frames == 0) {
+		perf_stat_reset(&perf_cursor);
+		perf_stat_reset(&perf_capture);
+		perf_stat_reset(&perf_export);
+		perf_stat_reset(&perf_draw);
+		perf_stat_reset(&perf_swap);
+		perf_stat_reset(&perf_total);
+		perf_window_start = now;
+	}
+
+	perf_stat_add(&perf_cursor, cursor_us);
+	perf_stat_add(&perf_capture, capture_us);
+	perf_stat_add(&perf_export, export_us);
+	perf_stat_add(&perf_draw, draw_us);
+	perf_stat_add(&perf_swap, swap_us);
+	perf_stat_add(&perf_total, total_us);
+	perf_frames++;
+
+	if (now - perf_window_start >= 2 * G_USEC_PER_SEC) {
+		gdouble elapsed_s = (now - perf_window_start) / 1e6;
+		fprintf(stderr, "perf: %u frames in %.2fs (%.1f fps)\n",
+				perf_frames, elapsed_s, perf_frames / elapsed_s);
+		perf_stat_report(&perf_cursor,  "cursor",  perf_frames);
+		perf_stat_report(&perf_capture, "capture", perf_frames);
+		perf_stat_report(&perf_export,  "export",  perf_frames);
+		perf_stat_report(&perf_draw,    "draw",    perf_frames);
+		perf_stat_report(&perf_swap,    "swap",    perf_frames);
+		perf_stat_report(&perf_total,   "total",   perf_frames);
+		perf_frames = 0;  // next frame re-opens a window via the branch above
+	}
+}
+
+void x11_refresh_active_window_cross_server(void);
+
 gboolean
 x11_refresh_image(const GdkRectangle* damaged_rect)
 {
 	if (!pixmap || !window) return FALSE;
 
+	frame_counter++;
+
+	gint64 perf_t0 = 0, perf_t1 = 0, perf_t2 = 0, perf_t3 = 0, perf_t4 = 0, perf_t5 = 0;
+	if (config.opt_perf_log) perf_t0 = g_get_monotonic_time();
+
 #ifdef HAVE_XI
-	if (!can_track_cursor)
+	// In cross-server mode the XI motion events arrive on the DESTINATION
+	// server (:1), which is useless for following the SOURCE (:0) cursor, so
+	// XI-driven tracking is bypassed (see x11_on_x11_event) and we poll the
+	// source pointer here on the periodic refresh instead.
+	if (!can_track_cursor || use_cross_server)
 #endif
 	{
 		x11_refresh_cursor_location(FALSE);
 	}
+	if (use_cross_server && src_display) {
+		x11_refresh_active_window_cross_server();
+	}
+	if (config.opt_perf_log) perf_t1 = g_get_monotonic_time();
 
+	x11_clear_cursor();
+
+	// Check if we're in cross-server mode
+	if (use_cross_server && src_display) {
+		// XCopyArea from source root to persistent pixmap.
+		// IncludeInferiors is essential: with the default ClipByChildren the
+		// copy sees only the root window's own drawing (the desktop
+		// background), which is black under a compositing WM like KWin --
+		// every application window is a child of root and gets clipped out.
+		// IncludeInferiors pulls the composited child-window content too, so
+		// the pixmap (and thus the DRI3-exported DMA-BUF) holds the real
+		// desktop image.
+		XGCValues gc_vals = {0};
+		gc_vals.subwindow_mode = IncludeInferiors;
+		GC gc = XCreateGC(src_display, src_pixmap, GCSubwindowMode, &gc_vals);
+
+		XCopyArea(src_display, XDefaultRootWindow(src_display), src_pixmap, gc,
+				 damaged_rect->x, damaged_rect->y,
+				 damaged_rect->width, damaged_rect->height,
+				 0, 0);
+
+		XFreeGC(src_display, gc);
+
+#ifdef COPY_CURSOR
+		// Bake the source cursor into the freshly-copied desktop before export.
+		// (The next frame's XCopyArea wipes it, so no trails.)
+		x11_composite_source_cursor();
+#endif
+
+		XSync(src_display, False);  // Wait for blit (and cursor composite)
+		if (config.opt_perf_log) perf_t2 = g_get_monotonic_time();
+
+		// Try DRI3/EGL path first
+		if (dri3_available && egl_ctx) {
+			uint32_t drm_format = 0;
+			int stride = 0;
+			uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+			int fd = dri3_export_pixmap(src_xcb, src_pixmap,
+									   src_rect.width, src_rect.height,
+									   &drm_format, &stride, &modifier);
+			if (config.opt_perf_log) perf_t3 = g_get_monotonic_time();
+			if (fd >= 0) {
+				// If this is the first frame, create texture from fd
+				if (egl_texture == 0) {
+					egl_texture = egl_create_image_from_fd(egl_ctx, fd,
+														  src_rect.width, src_rect.height,
+														  stride, drm_format, modifier);
+					close(fd);  // fd no longer needed; EGLImage owns the buffer
+					if (egl_texture == 0) {
+						fprintf(stderr, "x11: failed to create EGL texture\n");
+						dri3_available = FALSE;  // Fallback to XShm
+					}
+				} else {
+					close(fd);  // XCopyArea updated pixmap in-place
+				}
+
+				if (egl_texture) {
+					egl_draw_quad(egl_ctx, egl_texture);
+					if (config.opt_perf_log) perf_t4 = g_get_monotonic_time();
+					egl_swap_buffers(egl_ctx);
+					if (config.opt_perf_log) {
+						perf_t5 = g_get_monotonic_time();
+						x11_perf_frame(perf_t1 - perf_t0, perf_t2 - perf_t1,
+									   perf_t3 - perf_t2, perf_t4 - perf_t3,
+									   perf_t5 - perf_t4, perf_t5 - perf_t0);
+					}
+					return TRUE;
+				}
+			}
+		}
+
+		// Fallback to XShm if DRI3 unavailable
+#ifdef HAVE_MIT_SHM
+		gboolean result = x11_refresh_image_shm_fallback(src_display, damaged_rect);
+		XFlush(display);
+		if (config.opt_perf_log)
+			x11_perf_frame(perf_t1 - perf_t0, perf_t2 - perf_t1, 0, 0, 0,
+						   g_get_monotonic_time() - perf_t0);
+		return result;
+#else
+		// Cross-server mode requires MIT-SHM support
+		g_warning("cross-server mode requires DRI3 or MIT-SHM support");
+		XFlush(display);
+		return FALSE;
+#endif
+	}
+
+	// Original same-server rendering path
 	// location of the damaged area relative to the source rect
 	int x = damaged_rect->x - src_rect.x;
 	int y = damaged_rect->y - src_rect.y;
-
-	x11_clear_cursor();
 
 	XCopyArea (display, root_window, pixmap, gc,
 			damaged_rect->x,     damaged_rect->y,
@@ -287,6 +575,9 @@ x11_refresh_image(const GdkRectangle* damaged_rect)
 	XClearArea(display, window, x, y, damaged_rect->width, damaged_rect->height, FALSE);
 
 	XFlush (display);
+
+	if (config.opt_perf_log)
+		x11_perf_frame(perf_t1 - perf_t0, 0, 0, 0, 0, g_get_monotonic_time() - perf_t0);
 
 	return TRUE;
 }
@@ -469,6 +760,102 @@ x11_disable_copy_cursor()
 		pixmap_picture = 0;
 	}
 }
+
+// Set up the source-cursor overlay resources on the source display. Safe to
+// call once at init; a no-op unless cross-server and XFixes+XRender exist on
+// the source. Leaves src_cursor_avail FALSE if anything is missing (the mirror
+// then simply shows no cursor, as before).
+static void
+x11_init_source_cursor(void)
+{
+	if (!use_cross_server || !src_display) {
+		return;
+	}
+
+	int ev, er, major = 1, minor = 0;
+	if (   !XFixesQueryExtension(src_display, &ev, &er)
+	    || !XFixesQueryVersion(src_display, &major, &minor)
+	    || (major < 1)
+	    || !XRenderQueryExtension(src_display, &ev, &er)) {
+		fprintf(stderr, "x11: source display lacks XFixes/XRender; no cursor overlay\n");
+		return;
+	}
+
+	XRenderPictFormat* argb = XRenderFindStandardFormat(src_display, PictStandardARGB32);
+	if (!argb) {
+		return;
+	}
+
+	src_cursor_pixels = (uint32_t*) malloc(CURSOR_PIXELS_SIZE);
+	src_cursor_ximage = XCreateImage(src_display, NULL, 32, ZPixmap, 0,
+			(char*)src_cursor_pixels, CURSOR_SIZE, CURSOR_SIZE, 32, 4*CURSOR_SIZE);
+	if (!src_cursor_ximage) {
+		free(src_cursor_pixels);
+		src_cursor_pixels = NULL;
+		return;
+	}
+
+	src_cursor_pixmap = XCreatePixmap(src_display, XDefaultRootWindow(src_display),
+			CURSOR_SIZE, CURSOR_SIZE, 32);
+	src_cursor_gc = XCreateGC(src_display, src_cursor_pixmap, 0, NULL);
+	src_cursor_picture = XRenderCreatePicture(src_display, src_cursor_pixmap, argb, 0, NULL);
+
+	src_cursor_avail = TRUE;
+}
+
+// Composite the current source-display cursor into src_pixmap at its live
+// position. Called each frame in the cross-server EGL path, after XCopyArea has
+// refreshed src_pixmap and before the DRI3 export.
+static void
+x11_composite_source_cursor(void)
+{
+	if (!src_cursor_avail || !src_pixmap) {
+		return;
+	}
+
+	XFixesCursorImage* img = XFixesGetCursorImage(src_display);
+	if (!img) {
+		return;
+	}
+
+	int w = (img->width  < CURSOR_SIZE) ? img->width  : CURSOR_SIZE;
+	int h = (img->height < CURSOR_SIZE) ? img->height : CURSOR_SIZE;
+
+	// Top-left of the cursor image in source-pixmap (src_rect-local) coords.
+	int px = (img->x - img->xhot) - src_rect.x;
+	int py = (img->y - img->yhot) - src_rect.y;
+
+	// Cull if the cursor is entirely outside the current source rect.
+	if (px + w <= 0 || py + h <= 0 || px >= src_rect.width || py >= src_rect.height) {
+		XFree(img);
+		return;
+	}
+
+	// Copy the ARGB pixels (img->pixels is unsigned long per pixel; take the
+	// low 32 bits) into our scratch image and upload it to the ARGB pixmap.
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < w; x++) {
+			src_cursor_pixels[y*CURSOR_SIZE + x] = (uint32_t) img->pixels[y*img->width + x];
+		}
+	}
+	XFillRectangle(src_display, src_cursor_pixmap, src_cursor_gc, 0, 0, CURSOR_SIZE, CURSOR_SIZE);
+	XPutImage(src_display, src_cursor_pixmap, src_cursor_gc, src_cursor_ximage,
+			0, 0, 0, 0, w, h);
+	XFree(img);
+
+	// (Re)create the RGB24 Picture wrapping src_pixmap. It's dropped whenever
+	// src_pixmap is reallocated on a source switch (see x11_free_source_buffer).
+	if (!src_pixmap_picture) {
+		src_pixmap_picture = XRenderCreatePicture(src_display, src_pixmap,
+				XRenderFindStandardFormat(src_display, PictStandardRGB24), 0, NULL);
+	}
+
+	// PictOpOver blends the cursor's alpha over the desktop. XRender clips to
+	// the destination pixmap, so partially-offscreen cursors are handled.
+	XRenderComposite(src_display, PictOpOver,
+			src_cursor_picture, None, src_pixmap_picture,
+			0, 0, 0, 0, px, py, w, h);
+}
 #endif
 
 
@@ -511,7 +898,7 @@ x11_show_active_window()
 }
 
 gboolean
-x11_get_window_geometry(Window w, GdkRectangle* r)
+x11_get_window_geometry(Display* dpy, Window w, GdkRectangle* r)
 {
 	gboolean result;
 	Window root;
@@ -520,7 +907,7 @@ x11_get_window_geometry(Window w, GdkRectangle* r)
 
 	gdk_x11_display_error_trap_push(gdisplay);
 
-	if (XGetGeometry(display, w, &root, &x, &y, &width, &height,
+	if (XGetGeometry(dpy, w, &root, &x, &y, &width, &height,
 			&border_width, &depth))
 	{
 		r->x = x - border_width;
@@ -543,6 +930,14 @@ x11_refresh_active_window_geometry()
 	if(!active_window)
 		return;
 
+	// In cross-server mode active_window is a SOURCE (:0) XID -- walk its
+	// tree and query its geometry on src_display, same q_display/q_root
+	// pattern as x11_refresh_cursor_location. Single-server mode is
+	// unaffected: q_display == display, q_root == root_window.
+	Display* q_display = (use_cross_server && src_display) ? src_display : display;
+	Window   q_root    = (use_cross_server && src_display)
+	                       ? XDefaultRootWindow(src_display) : root_window;
+
 	// ignore X11 errors (this function can produce BadWindow errors since
 	// it makes queries on windows controlled by other applications)
 	gdk_x11_display_error_trap_push(gdisplay);
@@ -554,23 +949,23 @@ x11_refresh_active_window_geometry()
 
 		// identify the top-level window
 		parent = w;
-		while(parent != root_window)
+		while(parent != q_root)
 		{
 			w = parent;
-			if(!XQueryTree(display, w, &root, &parent, &children, &nchildren))
+			if(!XQueryTree(q_display, w, &root, &parent, &children, &nchildren))
 				goto err;
 			XFree(children);
 		}
-		
+
 		// get its coordinates
-		x11_get_window_geometry(w, &active_window_rect);
+		x11_get_window_geometry(q_display, w, &active_window_rect);
 	}
-err:	
+err:
 	gdk_x11_display_error_trap_pop_ignored(gdisplay);
 }
 
 Window
-x11_get_active_window()
+x11_get_active_window_on(Display* dpy, Window root, Atom atom)
 {
 	Window result = 0;
 	Window* w;
@@ -578,21 +973,42 @@ x11_get_active_window()
 	int  actual_format_return;
 	unsigned long nitems_return, bytes_after_return;
 
-	if (XGetWindowProperty(display, root_window, net_active_window_atom, 0, 1,
+	if (XGetWindowProperty(dpy, root, atom, 0, 1,
 			FALSE, AnyPropertyType,	&actual_type_return,
 			&actual_format_return, &nitems_return,
 			&bytes_after_return, (unsigned char**)&w)
 		== Success)
 	{
-		result = *w;
-		XFree(w);
+		// No window manager (e.g. a bare Squint-only display) never sets
+		// _NET_ACTIVE_WINDOW, in which case nitems_return is 0 and w is NULL.
+		if (w) {
+			if (nitems_return > 0)
+				result = *w;
+			XFree(w);
+		}
 	}
 	return result;
+}
+
+Window
+x11_get_active_window()
+{
+	return x11_get_active_window_on(display, root_window, net_active_window_atom);
 }
 
 void
 x11_active_window_stop_monitoring()
 {
+	// Cross-server: the poll below never subscribes StructureNotify on the
+	// tracked window (there's no async event channel from src_display to
+	// deliver it), so there's nothing to unwind here -- and active_window is
+	// a foreign :0 XID that XChangeWindowAttributes(display, ...) below would
+	// otherwise send to the wrong (:1) connection.
+	if (use_cross_server) {
+		active_window = 0;
+		return;
+	}
+
 	if (!gdk_x11_window_lookup_for_display(gdisplay, active_window))
 	{
 		// ignore X11 errors (this function can produce BadWindow errors since
@@ -648,6 +1064,68 @@ x11_active_window_start_monitoring()
 		gdk_x11_display_error_trap_pop_ignored(gdisplay);
 	}
 }
+
+// Cross-server counterpart to x11_active_window_start_monitoring's
+// PropertyNotify trigger. There is no WM on the destination (:1) to ever set
+// _NET_ACTIVE_WINDOW there, and no async event channel from the source
+// (:0) connection -- src_display is synchronous-query-only, never added to
+// the GLib main loop (see the XI_RawMotion comment in x11_on_x11_event). So,
+// like cursor-follow, poll _NET_ACTIVE_WINDOW on the SOURCE root every
+// damage-driven refresh, and only redo the geometry walk when the active
+// window handle actually changed.
+void
+x11_refresh_active_window_cross_server()
+{
+	if (!net_active_window_atom_src)
+		return;
+	if (n_src_monitors <= 1)
+		return;  // nothing to switch between (e.g. mirror 1)
+
+	Window w = x11_get_active_window_on(src_display, XDefaultRootWindow(src_display),
+	                                     net_active_window_atom_src);
+	if (w == active_window)
+		return;  // no focus change since the last poll
+
+	active_window = w;
+	if (!active_window)
+		return;
+
+	x11_refresh_active_window_geometry();
+	if (!memcmp(&active_window_rect, &src_root_window_rect, sizeof(GdkRectangle))) {
+		// same geometry as the source root window -> ignore it, same
+		// heuristic as x11_active_window_start_monitoring's single-server path
+		active_window = 0;
+		return;
+	}
+
+	x11_show_active_window();
+}
+
+#ifdef HAVE_XRANDR
+// A hotplug fires several RRScreenChangeNotify events in quick succession
+// while the output renegotiates EDID/mode, so re-enabling on the first one
+// would just get disabled again by the next. Debounce: each new event pushes
+// the retry back out, so squint_enable() only runs once the storm has settled.
+#define RANDR_REENABLE_DEBOUNCE_MS 2000
+static guint randr_reenable_source_id = 0;
+
+static gboolean
+x11_randr_reenable_cb(gpointer data)
+{
+	randr_reenable_source_id = 0;
+
+	// squint_enable() re-resolves our destination monitor via
+	// select_monitors() -- if it's still gone this is a no-op, if it's back
+	// this is the only thing that ever turns the mirror back on.
+	if (squint_enable()) {
+		fprintf(stderr, "x11: re-enabled after RandR screen change settled\n");
+	} else {
+		fprintf(stderr, "x11: still disabled after RandR screen change -- "
+			"destination monitor not found\n");
+	}
+	return G_SOURCE_REMOVE;
+}
+#endif
 
 GdkFilterReturn
 x11_on_x11_event (GdkXEvent *xevent, GdkEvent *event, gpointer data)
@@ -709,8 +1187,12 @@ x11_on_x11_event (GdkXEvent *xevent, GdkEvent *event, gpointer data)
 			switch (cookie->evtype)
 			{
 			case XI_RawMotion:
-				// cursor was moved
-				x11_refresh_cursor_location(FALSE);
+				// cursor was moved. In cross-server mode these events are for
+				// the destination (:1) pointer, not the source (:0) one we
+				// follow, so ignore them -- the refresh timer polls the source
+				// pointer instead (see x11_refresh_image).
+				if (!use_cross_server)
+					x11_refresh_cursor_location(FALSE);
 
 				return GDK_FILTER_REMOVE;
 			case XI_RawKeyPress:
@@ -822,7 +1304,23 @@ x11_on_x11_event (GdkXEvent *xevent, GdkEvent *event, gpointer data)
 	if (xrandr_event_base)
 	{
 		if (ev->type == xrandr_event_base + RRScreenChangeNotify) {
-			squint_disable();
+			// RRScreenChangeNotify is a per-root-window broadcast: it fires
+			// for every client that selected it on this root, regardless of
+			// which output actually changed. So a HDMI hotplug on :1 also
+			// disables a mirror whose own output (e.g. DP-3) never moved --
+			// log the full connector snapshot so that's distinguishable
+			// after the fact from a change that genuinely affects us.
+			char* outputs = x11_describe_randr_outputs(display);
+			fprintf(stderr, "x11: RandR screen change on %s -- %s\n",
+				DisplayString(display), outputs);
+			g_free(outputs);
+			squint_disable("RandR screen change");
+
+			if (randr_reenable_source_id) {
+				g_source_remove(randr_reenable_source_id);
+			}
+			randr_reenable_source_id = g_timeout_add(
+				RANDR_REENABLE_DEBOUNCE_MS, x11_randr_reenable_cb, NULL);
 		}
 	}
 #endif
@@ -893,6 +1391,17 @@ x11_init_xdamage()
 {
 	if (config.opt_rate > 0) {
 		// user requested fixed refresh rate
+		return;
+	}
+
+	if (use_cross_server) {
+		// XDamageCreate below watches root_window on `display`, which is
+		// the DESTINATION display. In cross-server mode that's a different
+		// X server than the one showing the actual content (src_display),
+		// so it never reports the real source changes -- leave xdamage
+		// disabled and let the periodic timer in x11_enable_window() poll
+		// the source display instead (see the `!(damage && can_track_cursor)`
+		// branch there).
 		return;
 	}
 
@@ -1004,6 +1513,27 @@ x11_on_window_configure_event(GtkWidget *widget, GdkEvent *event, gpointer   use
 }
 
 #ifdef HAVE_XRANDR
+// Heap-allocated "name=connected/disconnected/unknown ..." summary of every
+// RandR output on dpy's default screen. Caller g_free()s the result.
+static char*
+x11_describe_randr_outputs(Display* dpy)
+{
+	XRRScreenResources* res = XRRGetScreenResourcesCurrent(dpy, DefaultRootWindow(dpy));
+	if (!res) return g_strdup("(could not query RandR outputs)");
+
+	GString* s = g_string_new(NULL);
+	for (int i = 0; i < res->noutput; i++) {
+		XRROutputInfo* info = XRRGetOutputInfo(dpy, res, res->outputs[i]);
+		if (!info) continue;
+		g_string_append_printf(s, "%s%s=%s", i ? " " : "", info->name,
+			info->connection == RR_Connected    ? "connected" :
+			info->connection == RR_Disconnected ? "disconnected" : "unknown");
+		XRRFreeOutputInfo(info);
+	}
+	XRRFreeScreenResources(res);
+	return g_string_free(s, FALSE);
+}
+
 void
 x11_init_xrandr()
 {
@@ -1016,10 +1546,329 @@ x11_init_xrandr()
 }
 #endif
 
+// Periodic proof-of-life: silence in the log is ambiguous between "healthy,
+// nothing changed" and "quietly wedged/disabled", so log frame throughput and
+// enabled-state on a timer regardless of activity.
+static gboolean
+x11_heartbeat_cb(gpointer data)
+{
+	static unsigned long last_frame_counter = 0;
+	fprintf(stderr, "x11: heartbeat enabled=%d frames_total=%lu frames_since_last=%lu\n",
+		enabled, frame_counter, frame_counter - last_frame_counter);
+	last_frame_counter = frame_counter;
+	return G_SOURCE_CONTINUE;
+}
+
+// Map an X pixmap depth to a DRM fourcc format code.
+// Returns 0 on unsupported depth.
+static uint32_t depth_to_drm_format(int depth) {
+    switch (depth) {
+        case 24: return DRM_FORMAT_XRGB8888;
+        case 32: return DRM_FORMAT_ARGB8888;
+        case 16: return DRM_FORMAT_RGB565;
+        default: return 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linear source buffer allocation via GBM.
+//
+// AMD tiles its pixmaps with a vendor-specific DRM modifier that Intel cannot
+// import, and AMD's DRI3 reports the modifier as INVALID. The only pixel
+// layout both GPUs share is LINEAR. So instead of a plain XCreatePixmap (which
+// the AMD driver backs with a tiled buffer), we allocate a LINEAR buffer on
+// AMD's own device via GBM and wrap it as an X pixmap. XCopyArea then makes the
+// AMD driver de-tile the framebuffer into our linear buffer on-GPU, and Intel
+// can import that fd directly (as linear) without any CPU copy.
+//
+// libgbm ships no -devel package here, so we dlopen it and declare the few
+// prototypes we need -- no new build dependency.
+// ---------------------------------------------------------------------------
+struct gbm_device; struct gbm_bo;
+#define GBM_FORMAT_XRGB8888  0x34325258
+#define GBM_BO_USE_RENDERING (1u << 2)
+#define GBM_BO_USE_LINEAR    (1u << 4)
+
+static struct {
+    void* lib;
+    struct gbm_device* (*create_device)(int fd);
+    struct gbm_bo* (*bo_create)(struct gbm_device*, uint32_t, uint32_t, uint32_t, uint32_t);
+    int (*bo_get_fd)(struct gbm_bo*);
+    uint32_t (*bo_get_stride)(struct gbm_bo*);
+    void (*bo_destroy)(struct gbm_bo*);
+    void (*device_destroy)(struct gbm_device*);
+    int amd_fd;                 // DRI3-opened fd to AMD's DRM device
+    struct gbm_device* dev;
+    struct gbm_bo* bo;          // the persistent linear source buffer
+} gbm = { .amd_fd = -1 };
+
+// Load libgbm and resolve the symbols we use. Returns TRUE once ready.
+static gboolean gbm_load(void) {
+    if (gbm.lib) return TRUE;
+    gbm.lib = dlopen("libgbm.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!gbm.lib) {
+        fprintf(stderr, "x11: dlopen libgbm.so.1 failed: %s\n", dlerror());
+        return FALSE;
+    }
+    gbm.create_device  = dlsym(gbm.lib, "gbm_create_device");
+    gbm.bo_create      = dlsym(gbm.lib, "gbm_bo_create");
+    gbm.bo_get_fd      = dlsym(gbm.lib, "gbm_bo_get_fd");
+    gbm.bo_get_stride  = dlsym(gbm.lib, "gbm_bo_get_stride");
+    gbm.bo_destroy     = dlsym(gbm.lib, "gbm_bo_destroy");
+    gbm.device_destroy = dlsym(gbm.lib, "gbm_device_destroy");
+    if (!gbm.create_device || !gbm.bo_create || !gbm.bo_get_fd || !gbm.bo_get_stride) {
+        fprintf(stderr, "x11: libgbm missing required symbols\n");
+        dlclose(gbm.lib);
+        gbm.lib = NULL;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// Allocate a LINEAR source buffer on the source X server's GPU and wrap it as
+// an X pixmap. On success returns the pixmap XID and fills *out_stride; the
+// backing gbm_bo is retained in the gbm state (freed by gbm_free_linear).
+// Returns 0 on failure so the caller can fall back to the CPU/XShm path.
+static xcb_pixmap_t dri3_create_linear_pixmap(xcb_connection_t* conn, Window root,
+                                              int w, int h, int depth, int* out_stride) {
+    *out_stride = 0;
+    if (!gbm_load()) return 0;
+
+    // Get a usable fd for the source server's DRM device via DRI3.
+    if (gbm.amd_fd < 0) {
+        xcb_dri3_open_cookie_t oc = xcb_dri3_open(conn, root, 0);
+        xcb_dri3_open_reply_t* orep = xcb_dri3_open_reply(conn, oc, NULL);
+        if (!orep) { fprintf(stderr, "x11: xcb_dri3_open failed\n"); return 0; }
+        int* ofds = xcb_dri3_open_reply_fds(conn, orep);
+        gbm.amd_fd = (ofds && ofds[0] >= 0) ? ofds[0] : -1;
+        free(orep);
+        if (gbm.amd_fd < 0) { fprintf(stderr, "x11: DRI3 open gave no fd\n"); return 0; }
+    }
+    if (!gbm.dev) {
+        gbm.dev = gbm.create_device(gbm.amd_fd);
+        if (!gbm.dev) { fprintf(stderr, "x11: gbm_create_device failed\n"); return 0; }
+    }
+
+    uint32_t fourcc = depth_to_drm_format(depth);
+    if (fourcc == 0) fourcc = GBM_FORMAT_XRGB8888;
+    // Free any previous buffer before allocating a new one (a source switch
+    // reallocates for the new monitor's dimensions). x11_free_source_buffer()
+    // normally does this first, but guard here too so we never leak a bo.
+    if (gbm.bo && gbm.bo_destroy) { gbm.bo_destroy(gbm.bo); gbm.bo = NULL; }
+    gbm.bo = gbm.bo_create(gbm.dev, w, h, fourcc,
+                           GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+    if (!gbm.bo) { fprintf(stderr, "x11: gbm_bo_create(LINEAR) failed\n"); return 0; }
+
+    uint32_t stride = gbm.bo_get_stride(gbm.bo);
+    int fd = gbm.bo_get_fd(gbm.bo);      // fresh fd; consumed by pixmap_from_buffer
+    if (fd < 0) { fprintf(stderr, "x11: gbm_bo_get_fd failed\n"); return 0; }
+
+    xcb_pixmap_t px = xcb_generate_id(conn);
+    xcb_void_cookie_t pc = xcb_dri3_pixmap_from_buffer(
+        conn, px, root, stride * h, w, h, stride, depth, 32, fd);
+    xcb_generic_error_t* err = xcb_request_check(conn, pc);
+    if (err) {
+        fprintf(stderr, "x11: pixmap_from_buffer failed (err %d)\n", err->error_code);
+        free(err);
+        return 0;
+    }
+    *out_stride = stride;
+    fprintf(stderr, "x11: linear source pixmap 0x%x stride=%u (GBM)\n", px, stride);
+    return px;
+}
+
+// Destroy only the linear source buffer, keeping the GBM device + DRI3 fd for
+// reuse (they're re-openable but cheap to keep across a source switch).
+static void gbm_free_bo(void) {
+    if (gbm.bo && gbm.bo_destroy) { gbm.bo_destroy(gbm.bo); gbm.bo = NULL; }
+}
+
+static void gbm_free_linear(void) {
+    gbm_free_bo();
+    if (gbm.dev && gbm.device_destroy) { gbm.device_destroy(gbm.dev); gbm.dev = NULL; }
+    if (gbm.amd_fd >= 0) { close(gbm.amd_fd); gbm.amd_fd = -1; }
+}
+
+// Release the per-source GPU buffer: the EGL texture, its X pixmap, and the
+// GBM bo. The EGL texture is a live reference to a specific DMA-BUF; on a
+// source switch the buffer is reallocated for the new monitor, so a cached
+// texture would keep sampling the OLD buffer (which XCopyArea no longer
+// updates) and the mirror freezes/goes black. Dropping it here forces
+// x11_refresh_image to import a fresh texture from the new buffer. The GBM
+// device + DRI3 fd are kept (only gbm_free_linear tears those down).
+static void x11_free_source_buffer(void) {
+    if (egl_ctx && egl_texture) {
+        egl_delete_texture(egl_ctx, egl_texture);
+        egl_texture = 0;
+    }
+#ifdef COPY_CURSOR
+    // The cursor-overlay Picture wraps src_pixmap; drop it so the next frame
+    // rebuilds it against the newly-allocated pixmap.
+    if (src_pixmap_picture && src_display) {
+        XRenderFreePicture(src_display, src_pixmap_picture);
+        src_pixmap_picture = 0;
+    }
+#endif
+    if (src_pixmap && src_display) {
+        XFreePixmap(src_display, src_pixmap);
+        src_pixmap = 0;
+    }
+    gbm_free_bo();
+}
+
+// Export a pixmap as a DMA-BUF fd via DRI3.
+// Prefers DRI3 1.2 buffers_from_pixmap, which reports the DRM format
+// *modifier* describing the GPU's tiled/compressed memory layout. Without
+// the modifier the importing driver (Intel) assumes a linear layout and
+// mis-reads AMD's tiled buffer -- the image comes out horizontally streaked.
+// On success returns fd and fills *drm_format/*stride/*modifier. The modifier
+// is DRM_FORMAT_MOD_INVALID if only the legacy (DRI3 1.0) path was available.
+// Returns -1 on failure.
+static int dri3_export_pixmap(xcb_connection_t* conn, xcb_pixmap_t pixmap,
+                              int width, int height, uint32_t* drm_format,
+                              int* stride, uint64_t* modifier) {
+    // Initialize output parameters to safe defaults
+    *stride = 0;
+    *drm_format = 0;
+    *modifier = DRM_FORMAT_MOD_INVALID;
+
+    // Query DRI3 version to decide which export path is available.
+    xcb_dri3_query_version_cookie_t qv_cookie = xcb_dri3_query_version(conn, 1, 2);
+    xcb_dri3_query_version_reply_t* qv_reply = xcb_dri3_query_version_reply(conn, qv_cookie, NULL);
+    if (!qv_reply || qv_reply->major_version < 1) {
+        if (qv_reply) free(qv_reply);
+        fprintf(stderr, "x11: DRI3 not available\n");
+        return -1;
+    }
+    int have_1_2 = (qv_reply->major_version > 1) ||
+                   (qv_reply->major_version == 1 && qv_reply->minor_version >= 2);
+    free(qv_reply);
+
+    if (have_1_2) {
+        // DRI3 1.2 path: buffers_from_pixmap reports the modifier.
+        xcb_dri3_buffers_from_pixmap_cookie_t c =
+            xcb_dri3_buffers_from_pixmap(conn, pixmap);
+        xcb_dri3_buffers_from_pixmap_reply_t* r =
+            xcb_dri3_buffers_from_pixmap_reply(conn, c, NULL);
+        if (r) {
+            uint32_t fmt = depth_to_drm_format(r->depth);
+            int* fds = xcb_dri3_buffers_from_pixmap_reply_fds(conn, r);
+            uint32_t* strides = xcb_dri3_buffers_from_pixmap_strides(r);
+            if (fmt && r->nfd >= 1 && fds && fds[0] >= 0) {
+                if (r->nfd > 1) {
+                    // Multi-plane (e.g. AMD DCC): we only import plane 0. Close
+                    // the extra fds so we don't leak them. Plane 0 + modifier is
+                    // still usable; DCC metadata in later planes is ignored.
+                    for (int i = 1; i < r->nfd; i++)
+                        if (fds[i] >= 0) close(fds[i]);
+                    fprintf(stderr, "x11: DRI3 export returned %d planes; importing plane 0 only\n", r->nfd);
+                }
+                int fd = dup(fds[0]);
+                // fds[0] is ours from _reply_fds() (same as the extra planes
+                // closed above) and is never freed by free(r) -- leaving this
+                // out leaked one fd per frame, exhausting the 1024 fd table
+                // in a fixed ~42s and permanently breaking cross-server mode.
+                close(fds[0]);
+                *stride = strides ? strides[0] : 0;
+                *drm_format = fmt;
+                *modifier = r->modifier;
+                free(r);
+                return fd;
+            }
+            // Unsupported: close all fds and fall through to legacy path.
+            if (fds) for (int i = 0; i < r->nfd; i++)
+                if (fds[i] >= 0) close(fds[i]);
+            free(r);
+        }
+        fprintf(stderr, "x11: DRI3 1.2 buffers_from_pixmap unusable, trying 1.0\n");
+    }
+
+    // Legacy DRI3 1.0 path (no modifier -- assumes linear layout).
+    xcb_dri3_buffer_from_pixmap_cookie_t exp_cookie = xcb_dri3_buffer_from_pixmap(conn, pixmap);
+    xcb_dri3_buffer_from_pixmap_reply_t* exp_reply = xcb_dri3_buffer_from_pixmap_reply(conn, exp_cookie, NULL);
+    if (!exp_reply) {
+        fprintf(stderr, "x11: dri3_buffer_from_pixmap failed\n");
+        return -1;
+    }
+
+    int fd = -1;
+    int* fds = xcb_dri3_buffer_from_pixmap_reply_fds(conn, exp_reply);
+    if (fds && *fds >= 0) {
+        // Duplicate fd so we own a stable copy. XCB does NOT close reply fds
+        // on our behalf (free(exp_reply) below only frees the reply struct),
+        // so the original must be closed explicitly or it leaks every frame --
+        // this is the same fd-per-frame leak fixed in the DRI3 1.2 path above.
+        fd = dup(fds[0]);
+        close(fds[0]);
+    }
+
+    // Set output parameters (for EGLImage creation)
+    *stride = exp_reply->stride;
+    *drm_format = depth_to_drm_format(exp_reply->depth);
+    if (*drm_format == 0) {
+        fprintf(stderr, "x11: unsupported pixmap depth %d for DRI3 export\n", exp_reply->depth);
+        free(exp_reply);
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+
+    free(exp_reply);
+    return fd;
+}
+
 gboolean
 x11_init()
 {
 	display = gdk_x11_get_default_xdisplay();
+
+	// Cross-server initialization (Phase 1)
+	if (config.src_display_name || config.dst_display_name) {
+		// Determine source and destination display names
+		const char* src_name = config.src_display_name ? config.src_display_name : config.dst_display_name;
+		const char* dst_name = config.dst_display_name ? config.dst_display_name : config.src_display_name;
+
+		// If only one display was specified, use it for both source and destination
+		if (!config.src_display_name && !config.dst_display_name) {
+			// Both NULL, use default display (already open)
+			use_cross_server = FALSE;
+		} else if (g_strcmp0(src_name, dst_name) != 0) {
+			// Different source and destination displays
+			src_display = XOpenDisplay(src_name);
+			if (!src_display) {
+				squint_error("Failed to open source display");
+				return FALSE;
+			}
+			use_cross_server = TRUE;
+
+			// Get XCB connection from source display for DRI3 support
+			src_xcb = XGetXCBConnection(src_display);
+		} else {
+			// Same display name for both (or only one specified)
+			use_cross_server = FALSE;
+		}
+
+		// Check if DRI3 is available and initialize EGL if so
+		if (use_cross_server && src_xcb) {
+			xcb_dri3_query_version_cookie_t qv = xcb_dri3_query_version(src_xcb, 1, 0);
+			xcb_dri3_query_version_reply_t* qv_reply = xcb_dri3_query_version_reply(src_xcb, qv, NULL);
+			if (qv_reply && qv_reply->major_version >= 1) {
+				dri3_available = TRUE;
+				fprintf(stderr, "x11: DRI3 available, initializing EGL\n");
+				egl_ctx = egl_init(gdisplay);
+				if (!egl_ctx) {
+					fprintf(stderr, "x11: EGL initialization failed, falling back to XShm\n");
+					dri3_available = FALSE;
+				}
+			}
+			if (qv_reply) free(qv_reply);
+		}
+
+#ifdef COPY_CURSOR
+		// Set up the source-cursor overlay (no-op if not cross-server or if the
+		// source display lacks XFixes/XRender).
+		x11_init_source_cursor();
+#endif
+	}
 
 	screen = DefaultScreen (display);
 
@@ -1048,6 +1897,12 @@ x11_init()
 		}
 	}
 
+	// NOTE: the persistent DRI3 source pixmap is NOT created here. src_rect
+	// isn't populated yet at this point -- select_monitors() (which sets it)
+	// runs later, after x11_init() returns. Creating it here would make a
+	// zero-size pixmap that DRI3 can't export. It's created in
+	// x11_enable_window() instead, which runs after select_monitors().
+
 #ifdef HAVE_XRANDR
 	x11_init_xrandr();
 #endif
@@ -1061,8 +1916,12 @@ x11_init()
 	x11_init_xdamage();
 #endif
 
+	g_timeout_add_seconds(60, x11_heartbeat_cb, NULL);
+
 	// atom name
 	net_active_window_atom = XInternAtom(display, "_NET_ACTIVE_WINDOW", FALSE);
+	if (use_cross_server && src_display)
+		net_active_window_atom_src = XInternAtom(src_display, "_NET_ACTIVE_WINDOW", FALSE);
 
 	return TRUE;
 }
@@ -1216,6 +2075,33 @@ x11_enable_window()
 	// create the pixmap
 	pixmap = XCreatePixmap (display, root_window, src_rect.width, src_rect.height, depth);
 
+	// Create persistent pixmap for DRI3 export (cross-server mode). Done
+	// here rather than x11_init() because src_rect is only valid now, after
+	// select_monitors() has run.
+	if (dri3_available) {
+		int src_depth = DefaultDepth(src_display, DefaultScreen(src_display));
+		// Allocate the source pixmap as a LINEAR GBM buffer so the AMD driver
+		// de-tiles into it during XCopyArea and Intel can import it directly.
+		// A plain XCreatePixmap would be tiled and import as a scrambled image.
+		int lin_stride = 0;
+		src_pixmap = dri3_create_linear_pixmap(src_xcb,
+		                           XDefaultRootWindow(src_display),
+		                           src_rect.width, src_rect.height,
+		                           src_depth, &lin_stride);
+		if (!src_pixmap) {
+			// No linear GPU buffer -> the tiled DRI3 path would render a
+			// scrambled image, so fall back to the CPU/XShm path instead.
+			fprintf(stderr, "x11: linear pixmap alloc failed, falling back to XShm\n");
+			dri3_available = FALSE;
+		} else if (!egl_bind_window(egl_ctx, gdkwin)) {
+			// Bind an EGL surface to the destination window now that gdkwin is
+			// realized, and make it current -- required before any EGL/GL calls
+			// (eglCreateImageKHR etc.) can be dispatched to a vendor driver.
+			fprintf(stderr, "x11: egl_bind_window failed, falling back to XShm\n");
+			dri3_available = FALSE;
+		}
+	}
+
 #ifdef HAVE_XRENDER
 	if (config.opt_scale) {
 		x11_update_scale(dst_rect.width, dst_rect.height);
@@ -1229,7 +2115,11 @@ x11_enable_window()
 					0, CopyFromParent,
 					InputOutput, CopyFromParent,
 					CWBackPixel, &attr);
-		XMapWindow(display, window);
+		// See the DRI3/EGL comment in the non-scaled branch below: leave
+		// unmapped when EGL is rendering directly onto gdkwin.
+		if (!dri3_available) {
+			XMapWindow(display, window);
+		}
 
 		XRenderPictFormat *fmt = XRenderFindStandardFormat(display, PictStandardRGB24);
 		scale_src_picture = XRenderCreatePicture(display, pixmap, fmt, 0, NULL);
@@ -1254,7 +2144,16 @@ x11_enable_window()
 					0, CopyFromParent,
 					InputOutput, CopyFromParent,
 					CWBackPixmap, &attr);
-		XMapWindow(display, window);
+		// In DRI3/EGL mode, the frame is rendered by EGL directly onto
+		// gdkwin (the parent). This sub-window's background is only ever
+		// painted by the XShm/XCopyArea fallback path, which never runs
+		// once DRI3 succeeds -- leave it unmapped so it doesn't sit as an
+		// opaque black rectangle on top of the EGL-rendered content. It's
+		// still created (not left NULL) since cursor-follow code guards
+		// and moves/clears it regardless of render backend.
+		if (!dri3_available) {
+			XMapWindow(display, window);
+		}
 	}
 
 	// create a backup pixmap for storing the background (below the cursor)
@@ -1289,6 +2188,11 @@ x11_disable_window()
 
 	XFreePixmap(display, pixmap);
 	pixmap = 0;
+
+	// Drop the source DMA-BUF/texture so a source switch (which calls
+	// x11_disable_window then x11_enable_window) rebinds a fresh texture to the
+	// newly-allocated source buffer instead of sampling the stale one.
+	x11_free_source_buffer();
 }
 
 
@@ -1331,7 +2235,9 @@ x11_enable()
 
 	XFlush (display);
 
-	x11_get_window_geometry(root_window, &root_window_rect);
+	x11_get_window_geometry(display, root_window, &root_window_rect);
+	if (use_cross_server && src_display)
+		x11_get_window_geometry(src_display, XDefaultRootWindow(src_display), &src_root_window_rect);
 	x11_active_window_start_monitoring();
 
 	// catch all X11 events
@@ -1359,6 +2265,43 @@ x11_enable()
 void
 x11_disable()
 {
+	// Cleanup DRI3/EGL resources. src_display itself is a process-lifetime
+	// connection opened once in x11_init() -- NOT closed here, since disable
+	// is a pause (e.g. a RandR screen change), not a shutdown, and nothing
+	// ever reopens it: closing it here left any later squint_enable() call
+	// (RandR re-enable, or the tray-menu toggle in cross-server mode)
+	// dereferencing a NULL src_display in x11_enable_window()'s DRI3 setup.
+	//
+	// The source-cursor overlay (src_cursor_picture/gc/pixmap/ximage, set up
+	// once by x11_init_source_cursor() in x11_init()) is the same kind of
+	// process-lifetime state and is deliberately NOT torn down here either --
+	// it doesn't reference the destination window this function is about to
+	// destroy, and nothing ever calls x11_init_source_cursor() a second time
+	// to rebuild it. Tearing it down here silently disabled the mirrored
+	// cursor after the first RandR-triggered disable/re-enable cycle. Only
+	// src_pixmap_picture (the Picture wrapping src_pixmap, freed below via
+	// x11_disable_window() -> x11_free_source_buffer()) needs to go, since
+	// src_pixmap itself is reallocated fresh on every enable.
+	if (src_pixmap) {
+		XFreePixmap(src_display, src_pixmap);
+		src_pixmap = 0;
+	}
+	gbm_free_linear();
+	if (egl_ctx) {
+		// egl_ctx is also process-lifetime (created once in x11_init(),
+		// same as src_display above) -- egl_cleanup() would free its GL
+		// context/shader/VAO/VBO, which nothing ever recreates, leaving
+		// the next x11_enable_window()'s egl_bind_window() call to
+		// dereference a stale ctx. Only the window-bound surface needs to
+		// go, since the window itself is being destroyed; delete the
+		// texture first since it lives in the context we're keeping.
+		if (egl_texture) {
+			egl_delete_texture(egl_ctx, egl_texture);
+			egl_texture = 0;
+		}
+		egl_unbind_window(egl_ctx);
+	}
+
 #ifdef HAVE_XDAMAGE
 	if (refresh_timeout) {
 		g_source_remove(refresh_timeout);
