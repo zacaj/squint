@@ -481,7 +481,11 @@ x11_refresh_image(const GdkRectangle* damaged_rect)
 		// desktop image.
 		XGCValues gc_vals = {0};
 		gc_vals.subwindow_mode = IncludeInferiors;
-		GC gc = XCreateGC(src_display, src_pixmap, GCSubwindowMode, &gc_vals);
+		// graphics_exposures defaults to True, making every XCopyArea emit a
+		// NoExpose event. Nothing drains src_display's queue, so those queued
+		// forever inside Xlib (~224 bytes/frame -> GBs over days).
+		gc_vals.graphics_exposures = False;
+		GC gc = XCreateGC(src_display, src_pixmap, GCSubwindowMode | GCGraphicsExposures, &gc_vals);
 
 		XCopyArea(src_display, XDefaultRootWindow(src_display), src_pixmap, gc,
 				 damaged_rect->x, damaged_rect->y,
