@@ -13,6 +13,7 @@ struct egl_context {
     EGLSurface egl_surface;
     GLuint shader_program;
     GLuint vao, vbo;
+    GLuint overlay_vao, overlay_vbo;  // dynamic quad for egl_draw_overlay
     GdkWindow* gdkwin;
 };
 
@@ -116,6 +117,18 @@ static gboolean setup_gl_state(egl_context_t* ctx) {
     glEnableVertexAttribArray(pos_attr);
     glVertexAttribPointer(pos_attr, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
 
+    glEnableVertexAttribArray(tex_attr);
+    glVertexAttribPointer(tex_attr, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+
+    // Second VAO for egl_draw_overlay (e.g. the Wayland-source cursor): same
+    // layout, vertex data rewritten per draw.
+    glGenVertexArrays(1, &ctx->overlay_vao);
+    glGenBuffers(1, &ctx->overlay_vbo);
+    glBindVertexArray(ctx->overlay_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, ctx->overlay_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), NULL, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(pos_attr);
+    glVertexAttribPointer(pos_attr, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(tex_attr);
     glVertexAttribPointer(tex_attr, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
 
@@ -232,6 +245,7 @@ egl_context_t* egl_init(GdkDisplay* gdisplay) {
     ctx->gdkwin = NULL;
     ctx->shader_program = 0;
     ctx->vao = ctx->vbo = 0;
+    ctx->overlay_vao = ctx->overlay_vbo = 0;
 
     return ctx;
 }
@@ -331,6 +345,66 @@ void egl_draw_quad(egl_context_t* ctx, GLuint texture) {
     glUseProgram(0);
 }
 
+GLuint egl_create_texture(egl_context_t* ctx) {
+    if (!ctx) return 0;
+    GLuint texture;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return texture;
+}
+
+void egl_upload_texture(egl_context_t* ctx, GLuint texture, int width, int height,
+                        int stride, GLenum format, const void* data) {
+    if (!ctx || !texture || !data) return;
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, format,
+                 GL_UNSIGNED_BYTE, data);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    check_gl_error("upload_texture");
+}
+
+void egl_draw_overlay(egl_context_t* ctx, GLuint texture,
+                      float x, float y, float w, float h) {
+    if (!ctx || !texture || !ctx->overlay_vao) return;
+
+    // Window fractions (top-left origin) -> clip space (bottom-left origin).
+    float x0 = x * 2.0f - 1.0f, x1 = (x + w) * 2.0f - 1.0f;
+    float y0 = 1.0f - y * 2.0f, y1 = 1.0f - (y + h) * 2.0f;
+    float vertices[] = {
+        x0, y1,  0.0f, 1.0f,
+        x1, y1,  1.0f, 1.0f,
+        x1, y0,  1.0f, 0.0f,
+        x0, y0,  0.0f, 0.0f,
+    };
+
+    glUseProgram(ctx->shader_program);
+    glBindVertexArray(ctx->overlay_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, ctx->overlay_vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glUniform1i(glGetUniformLocation(ctx->shader_program, "texture0"), 0);
+
+    // Cursor bitmaps are straight (non-premultiplied) alpha.
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    glDisable(GL_BLEND);
+    check_gl_error("draw_overlay");
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
 void egl_swap_buffers(egl_context_t* ctx) {
     if (ctx && ctx->egl_surface != EGL_NO_SURFACE) {
         eglSwapBuffers(ctx->egl_display, ctx->egl_surface);
@@ -370,6 +444,12 @@ void egl_cleanup(egl_context_t* ctx) {
     }
     if (ctx->vbo) {
         glDeleteBuffers(1, &ctx->vbo);
+    }
+    if (ctx->overlay_vao) {
+        glDeleteVertexArrays(1, &ctx->overlay_vao);
+    }
+    if (ctx->overlay_vbo) {
+        glDeleteBuffers(1, &ctx->overlay_vbo);
     }
 
     if (ctx->egl_surface != EGL_NO_SURFACE) {

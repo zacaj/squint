@@ -27,6 +27,20 @@ GLuint egl_create_image_from_fd(egl_context_t* ctx, int fd, int width, int heigh
 // Render fullscreen quad with the given texture
 void egl_draw_quad(egl_context_t* ctx, GLuint texture);
 
+// Create an empty RGBA texture (linear filtering, clamp-to-edge) for CPU
+// uploads via egl_upload_texture. Requires a current context.
+GLuint egl_create_texture(egl_context_t* ctx);
+
+// (Re)upload 32bpp pixels into a texture created by egl_create_texture.
+// stride is in bytes; format is GL_RGBA or GL_BGRA.
+void egl_upload_texture(egl_context_t* ctx, GLuint texture, int width, int height,
+                        int stride, GLenum format, const void* data);
+
+// Alpha-blend a texture over the current frame. x/y/w/h are fractions of the
+// window (0..1, top-left origin). Call between egl_draw_quad and swap.
+void egl_draw_overlay(egl_context_t* ctx, GLuint texture,
+                      float x, float y, float w, float h);
+
 // Swap buffers (flip the EGL surface)
 void egl_swap_buffers(egl_context_t* ctx);
 

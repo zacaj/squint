@@ -483,12 +483,19 @@ init()
 	// already composite the source cursor into the image). Use a blank cursor
 	// over the mirror window so only the composited source cursor shows. In
 	// single-server mode keep the visible X cursor as before.
-	gboolean cross_server = config.src_display_name && config.dst_display_name
-		&& strcmp(config.src_display_name, config.dst_display_name) != 0;
+	gboolean cross_server = config.opt_wayland_source
+		|| (config.src_display_name && config.dst_display_name
+		    && strcmp(config.src_display_name, config.dst_display_name) != 0);
 	cursor_icon = gdk_cursor_new_for_display(gdisplay,
 			cross_server ? GDK_BLANK_CURSOR : GDK_X_CURSOR);
 
 	gboolean result = x11_init();
+#ifdef HAVE_PIPEWIRE
+	// The Wayland backend starts the portal handshake here; it calls
+	// squint_enable() itself once the streams are known.
+	if (result && config.opt_wayland_source)
+		result = wl_init();
+#endif
 
 #ifdef HAVE_APPINDICATOR
 	if (result) {
@@ -635,10 +642,40 @@ free_src_monitors_list()
 // 	n_src_monitors
 // 	dst_rect
 // 	dst_monitor
+#ifdef HAVE_PIPEWIRE
+// Wayland-source variant of select_monitors(): the sources are whatever the
+// portal session shares (chosen in its dialog), not monitors of gdisplay.
+static gboolean
+select_monitors_wayland()
+{
+	unselect_monitor(&dst_monitor, &dst_rect);
+	free_src_monitors_list();
+
+	n_src_monitors = wl_get_sources(&src_rects_list);
+	if (n_src_monitors == 0) {
+		squint_error("The screen cast portal shared no monitors");
+		return FALSE;
+	}
+	src_rect = src_rects_list[0];
+
+	if (config.dst_monitor_name) {
+		return select_monitor_by_name(gdisplay, config.dst_monitor_name, &dst_monitor, &dst_rect);
+	}
+	if (!select_any_monitor_but(gdisplay, &dst_monitor, &dst_rect, NULL)) {
+		squint_error("No destination monitor");
+		return FALSE;
+	}
+	return TRUE;
+}
+#endif
+
 gboolean
 select_monitors()
 {
 	int n;
+#ifdef HAVE_PIPEWIRE
+	if (config.opt_wayland_source) return select_monitors_wayland();
+#endif
 	unselect_monitor(&src_monitor, &src_rect);
 	unselect_monitor(&dst_monitor, &dst_rect);
 	free_src_monitors_list();
@@ -728,6 +765,14 @@ void
 squint_switch_source(int idx)
 {
 	g_assert(idx >= 0 && idx < n_src_monitors);
+#ifdef HAVE_PIPEWIRE
+	if (config.opt_wayland_source) {
+		src_rect = src_rects_list[idx];
+		wl_switch_source(idx);
+		squint_show();
+		return;
+	}
+#endif
 	if (src_monitor) g_object_unref(src_monitor);
 	src_monitor = g_object_ref(src_monitors_list[idx]);
 	src_rect = src_rects_list[idx];
@@ -832,6 +877,11 @@ squint_enable()
 		{
 			enable_window();
 
+#ifdef HAVE_PIPEWIRE
+			if (config.opt_wayland_source)
+				wl_enable();
+			else
+#endif
 			x11_enable();
 
 			enabled = TRUE;
@@ -850,6 +900,11 @@ squint_disable(const char* reason)
 
 	enabled = FALSE;
 
+#ifdef HAVE_PIPEWIRE
+	if (config.opt_wayland_source)
+		wl_disable();
+	else
+#endif
 	x11_disable();
 
 	disable_window();
@@ -876,6 +931,10 @@ GOptionEntry option_entries[] = {
   { "switch-threshold",	'T',	0,	G_OPTION_ARG_INT,	&config.opt_switch_threshold,	"Pixels cursor must travel into a new monitor before switching (default 100, 0 to disable)", "N"},
   { "src-display",	0,	0,	G_OPTION_ARG_STRING,	&config.src_display_name,	"X11 display for source (default: $DISPLAY)", "DISPLAY"},
   { "dst-display",	0,	0,	G_OPTION_ARG_STRING,	&config.dst_display_name,	"X11 display for mirror window (default: same as source)", "DISPLAY"},
+#ifdef HAVE_PIPEWIRE
+  { "wayland-source",	0,	0,	G_OPTION_ARG_NONE,	&config.opt_wayland_source,	"Capture the source from the Wayland session via the screen cast portal (sources = monitors picked in the portal dialog, ordered left to right)", NULL},
+  { "portal-id",	0,	0,	G_OPTION_ARG_STRING,	&config.portal_id,	"Name under which the portal permission (restore token) is remembered; use a distinct one per mirror (default: \"default\")", "NAME"},
+#endif
   { NULL }
 };
 
@@ -908,6 +967,10 @@ main (int argc, char *argv[])
 	config.opt_limit = -1;
 	config.opt_warp_cursor = TRUE;
 	config.opt_switch_threshold = 75;
+
+	// The mirror window is always X11 (EGL path uses GDK's X11 backend), even
+	// when launched from a Wayland session to capture it.
+	gdk_set_allowed_backends("x11");
 
 	// Pre-scan argv for --dst-display before gtk_init (so GDK connects to correct display)
 	for (int i = 1; i < argc - 1; i++) {
@@ -1002,8 +1065,12 @@ main (int argc, char *argv[])
 	resolve_monitor_number(src_gdisplay, &config.src_monitor_name);
 	resolve_monitor_number(gdisplay, &config.dst_monitor_name);
 
-	// activation
-	if (!config.opt_disable) {
+	if (config.opt_wayland_source && config.src_monitor_name)
+		fprintf(stderr, "warning: source monitors are chosen in the portal dialog with "
+				"--wayland-source; ignoring '%s'\n", config.src_monitor_name);
+
+	// activation (the Wayland backend enables itself once the portal is ready)
+	if (!config.opt_disable && !config.opt_wayland_source) {
 		squint_enable();
 	}
 

@@ -24,6 +24,9 @@ RUN dnf install -y \
     libxcb-devel \
     mesa-libEGL-devel \
     mesa-libGL-devel \
+    libdrm-devel \
+    # Wayland source capture (xdg-desktop-portal ScreenCast -> PipeWire)
+    pipewire-devel \
     # Nested X server for cross-server testing
     xorg-x11-server-Xephyr \
     && dnf clean all
