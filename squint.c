@@ -925,7 +925,8 @@ GOptionEntry option_entries[] = {
 #endif
 #ifdef HAVE_KMS
   { "kms-source",	0,	0,	G_OPTION_ARG_NONE,	&config.opt_kms_source,	"Capture the source by reading the scanout buffers of a KMS device directly (needs CAP_SYS_ADMIN; sources = connector names like DP-1, comma-separated, default all lit outputs)", NULL},
-  { "kms-device",	0,	0,	G_OPTION_ARG_STRING,	&config.kms_device,	"DRM device to capture with --kms-source (default /dev/dri/card0)", "PATH"},
+  { "kms-device",	0,	0,	G_OPTION_ARG_STRING,	&config.kms_device,	"DRM device to capture with --kms-source (default: the card with lit outputs that isn't the destination's GPU)", "PATH"},
+  { "kms-transfer",	0,	0,	G_OPTION_ARG_STRING,	&config.kms_transfer,	"How --kms-source frames reach the destination GPU: dmabuf (zero-copy linear buffer), readback (CPU copy, works between any vendors) or auto (dmabuf, else readback; default)", "MODE"},
 #endif
   { NULL }
 };

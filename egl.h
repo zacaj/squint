@@ -56,6 +56,11 @@ void egl_delete_texture(egl_context_t* ctx, GLuint texture);
 // squint_disable()/squint_enable() cycle, as opposed to process shutdown.
 void egl_unbind_window(egl_context_t* ctx);
 
+// DRM primary node (e.g. /dev/dri/card1) of the GPU behind this context, or
+// NULL if EGL can't tell (needs EGL_EXT_device_query + EGL_EXT_device_drm).
+// g_free() the result.
+char* egl_get_drm_device(egl_context_t* ctx);
+
 // Make this context (and its bound window surface, if any) current again,
 // e.g. after another EGL context in the process was used.
 gboolean egl_make_current(egl_context_t* ctx);

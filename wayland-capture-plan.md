@@ -92,6 +92,12 @@ Both backends share the `capture_backend_t` interface in `squint.h`.
   (multi-plane DCC ok), composite the HW cursor plane, write into a linear GBM BO
   (double-buffered), `glFinish`. Destination GPU imports each linear BO once.
 - Cursor-follow: whichever CRTC has its cursor plane enabled.
+- Vendor/direction neutral: source = any KMS card (default: lit outputs and not the
+  destination's GPU, via EGL_EXT_device_query); GBM retries on the primary node if the
+  render node fails (NVIDIA). `--kms-transfer=auto|dmabuf|readback`: auto tries the
+  zero-copy linear dma-buf and falls back to glReadPixels->PBO->CPU upload if any step
+  fails (expected for NVIDIA on either side). Not handled: same-GPU shortcut (would skip
+  the intermediate copy), async double-PBO readback.
 - Needs CAP_SYS_ADMIN for GETFB2 handles: `sudo setcap cap_sys_admin+ep builddir/squint`
   (redo after every rebuild).
 - Limits: overlay planes (direct-scanout video) are not composited; plane scaling/
@@ -100,7 +106,8 @@ Both backends share the `capture_backend_t` interface in `squint.h`.
 
 Run (sources = connector names or 1-based numbers, as printed at startup):
 
-    squint --kms-source [--kms-device /dev/dri/card0] --dst-display :1 --perf-log DP-1,DP-2
+    squint --kms-source [--kms-device /dev/dri/cardN] [--kms-transfer auto|dmabuf|readback] \
+           --dst-display :1 --perf-log DP-1,DP-2
 
 Compare against the portal backend with `--perf-log`:
 - `perf[kms]`: vblank->swap = latch of the new flip -> our swap returned.

@@ -10,9 +10,23 @@
 //      plane moved/changed -> new frame;
 //   3. source-GPU EGL (GBM platform, surfaceless): import the scanout FB with
 //      its real modifier (tiled/DCC, multi-plane) and the cursor FB, draw both
-//      into a LINEAR GBM buffer, glFinish;
-//   4. destination EGL: draw that linear buffer (imported once per buffer,
-//      double-buffered) into the window and swap.
+//      into an intermediate buffer;
+//   4. hand it to the destination GPU, by one of two transfers:
+//      - dmabuf:   the intermediate is a LINEAR GBM buffer (double-buffered)
+//                  that the destination imports once -- zero-copy, glFinish
+//                  for sync. Needs the source driver to put shareable linear
+//                  buffers in memory the other GPU can reach (amdgpu, i915,
+//                  nouveau do; NVIDIA's proprietary driver generally doesn't).
+//      - readback: the intermediate is a plain texture, glReadPixels into a
+//                  PBO, CPU upload on the destination. Works between any two
+//                  vendors, costs a frame-sized copy each way.
+//      --kms-transfer=auto tries dmabuf and falls back to readback if any
+//      step of it fails;
+//   5. destination EGL: draw into the window and swap.
+//
+// Vendor-neutral by construction: no driver is special-cased, the source is
+// any KMS device (auto: the one with lit outputs that isn't the destination's
+// GPU) and the destination is whatever GPU runs the X server of the window.
 //
 // Needs CAP_SYS_ADMIN (or DRM master): without it GETFB2 returns no GEM
 // handles. `sudo setcap cap_sys_admin+ep builddir/squint` is enough.
@@ -70,12 +84,14 @@ typedef struct {
 	int crtc;               // index into crtcs[]
 	GdkRectangle rect;
 
-	// linear double buffer (source GPU renders, destination GPU samples)
+	// intermediate buffers (source GPU renders, destination GPU samples)
 	int out_w, out_h;
-	struct gbm_bo* bo[2];
+	int transfer;           // XFER_DMABUF / XFER_READBACK once allocated
+	struct gbm_bo* bo[2];   // dmabuf: linear double buffer
 	EGLImageKHR src_image[2];
-	GLuint src_tex[2], src_fbo[2];
-	GLuint dst_tex[2];
+	GLuint src_tex[2], src_fbo[2];  // readback uses only [0]
+	GLuint pbo;             // readback: pack buffer
+	GLuint dst_tex[2];      // readback uses only [0]
 	int cur;
 
 	uint32_t last_fb;
@@ -83,6 +99,10 @@ typedef struct {
 	int drawn_cx, drawn_cy;
 	uint32_t drawn_cursor_fb;
 } kms_out_t;
+
+enum { XFER_AUTO, XFER_DMABUF, XFER_READBACK };
+static const char* xfer_names[] = { "auto", "dmabuf", "readback" };
+static int transfer_mode = XFER_AUTO;  // resolved to DMABUF/READBACK on first alloc
 
 // device
 static int card_fd = -1;
@@ -165,6 +185,21 @@ compile(GLenum type, const char* src)
 	return sh;
 }
 
+static void
+src_egl_cleanup(void)
+{
+	if (src_ctx != EGL_NO_CONTEXT) {
+		eglMakeCurrent(src_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+		eglDestroyContext(src_dpy, src_ctx);
+	}
+	if (src_dpy != EGL_NO_DISPLAY) eglTerminate(src_dpy);
+	if (gbm) gbm_device_destroy(gbm);
+	src_ctx = EGL_NO_CONTEXT;
+	src_dpy = EGL_NO_DISPLAY;
+	gbm = NULL;
+	src_prog = 0;
+}
+
 static gboolean
 src_egl_init(void)
 {
@@ -190,8 +225,10 @@ src_egl_init(void)
 		fprintf(stderr, "kms: source EGL context failed (0x%x)\n", eglGetError());
 		return FALSE;
 	}
+	char* node = drmGetDeviceNameFromFd2(render_fd);
 	fprintf(stderr, "kms: source EGL %d.%d on %s (%s)\n", maj, min,
-			drmGetDeviceNameFromFd2(render_fd), glGetString(GL_RENDERER));
+			node ? node : "?", glGetString(GL_RENDERER));
+	free(node);
 
 	// Texture rows and framebuffer rows are both "memory row 0 first", so an
 	// identity mapping copies the image without any flip.
@@ -384,50 +421,112 @@ out_free_buffers(kms_out_t* o)
 		o->src_image[i] = NULL;
 		o->bo[i] = NULL;
 	}
+	if (o->pbo) glDeleteBuffers(1, &o->pbo);
+	o->pbo = 0;
 	o->out_w = o->out_h = 0;
+	o->transfer = 0;
+	o->cur = 0;
 }
 
-// (Re)allocate the linear pair for a w x h source. Source context current on
-// entry; destination context current on return.
 static gboolean
-out_alloc_buffers(kms_out_t* o, int w, int h)
+fbo_for(GLuint tex, GLuint* fbo)
 {
-	out_free_buffers(o);
+	glGenFramebuffers(1, fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+	gboolean ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	return ok;
+}
+
+// readback: plain RGBA texture + FBO on the source, PBO for glReadPixels, a
+// CPU-upload texture on the destination. Source context current on entry.
+static gboolean
+alloc_readback(kms_out_t* o, int w, int h)
+{
+	glGenTextures(1, &o->src_tex[0]);
+	glBindTexture(GL_TEXTURE_2D, o->src_tex[0]);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	if (!fbo_for(o->src_tex[0], &o->src_fbo[0])) return FALSE;
+	glGenBuffers(1, &o->pbo);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, o->pbo);
+	glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)w * h * 4, NULL, GL_STREAM_READ);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+	egl_make_current(dst_ctx);
+	o->dst_tex[0] = egl_create_texture(dst_ctx);
+	return o->dst_tex[0] != 0;
+}
+
+// dmabuf: linear GBM double buffer imported on both GPUs. Source context
+// current on entry. Any failure -> FALSE (caller cleans up / falls back).
+static gboolean
+alloc_dmabuf(kms_out_t* o, int w, int h)
+{
 	int fds[2] = { -1, -1 };
 	uint32_t strides[2];
-	for (int i = 0; i < 2; i++) {
+	gboolean ok = TRUE;
+	for (int i = 0; i < 2 && ok; i++) {
 		o->bo[i] = gbm_bo_create(gbm, w, h, GBM_FORMAT_XRGB8888,
 				GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
-		if (!o->bo[i]) { fprintf(stderr, "kms: linear gbm_bo_create failed\n"); return FALSE; }
+		if (!o->bo[i]) { fprintf(stderr, "kms: linear gbm_bo_create failed\n"); ok = FALSE; break; }
 		fds[i] = gbm_bo_get_fd(o->bo[i]);
 		strides[i] = gbm_bo_get_stride(o->bo[i]);
 		uint32_t off = 0;
 		o->src_image[i] = src_import(1, &fds[i], &strides[i], &off, w, h,
 				DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR);
-		if (!o->src_image[i]) return FALSE;
+		if (!o->src_image[i]) { ok = FALSE; break; }
 		o->src_tex[i] = tex_from_image(o->src_image[i]);
-		glGenFramebuffers(1, &o->src_fbo[i]);
-		glBindFramebuffer(GL_FRAMEBUFFER, o->src_fbo[i]);
-		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, o->src_tex[i], 0);
-		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		if (!fbo_for(o->src_tex[i], &o->src_fbo[i])) {
 			fprintf(stderr, "kms: linear FBO incomplete\n");
-			return FALSE;
+			ok = FALSE;
 		}
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	}
+	if (ok) {
+		egl_make_current(dst_ctx);
+		for (int i = 0; i < 2 && ok; i++) {
+			o->dst_tex[i] = egl_create_image_from_fd(dst_ctx, fds[i], w, h, strides[i],
+					DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR);
+			if (!o->dst_tex[i]) {
+				fprintf(stderr, "kms: the destination GPU could not import the linear buffer\n");
+				ok = FALSE;
+			}
+		}
+	}
+	for (int i = 0; i < 2; i++)
+		if (fds[i] >= 0) close(fds[i]);
+	return ok;
+}
 
-	egl_make_current(dst_ctx);
-	for (int i = 0; i < 2; i++) {
-		o->dst_tex[i] = egl_create_image_from_fd(dst_ctx, fds[i], w, h, strides[i],
-				DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR);
-		close(fds[i]);
-		if (!o->dst_tex[i]) {
-			kms_fatal("the destination GPU could not import the linear buffer");
+// (Re)allocate the intermediates for a w x h source, picking the transfer.
+// Source context current on entry; destination context current on return.
+static gboolean
+out_alloc_buffers(kms_out_t* o, int w, int h)
+{
+	out_free_buffers(o);
+	src_make_current();
+	if (transfer_mode != XFER_READBACK) {
+		if (alloc_dmabuf(o, w, h)) {
+			o->transfer = XFER_DMABUF;
+		} else if (transfer_mode == XFER_DMABUF) {
+			kms_fatal("--kms-transfer=dmabuf: zero-copy sharing between these GPUs failed");
+		} else {
+			fprintf(stderr, "kms: zero-copy sharing failed, falling back to readback\n");
+			out_free_buffers(o);
+			transfer_mode = XFER_READBACK;  // don't retry for other outputs
+			src_make_current();
 		}
 	}
+	if (!o->transfer) {
+		if (!alloc_readback(o, w, h)) return FALSE;
+		o->transfer = XFER_READBACK;
+	}
+	if (transfer_mode == XFER_AUTO) transfer_mode = o->transfer;
 	o->out_w = w;
 	o->out_h = h;
-	fprintf(stderr, "kms: %s: linear %dx%d double buffer ready\n", crtcs[o->crtc].name, w, h);
+	fprintf(stderr, "kms: %s: %dx%d via %s\n", crtcs[o->crtc].name, w, h,
+			o->transfer == XFER_DMABUF ? "linear dma-buf (zero-copy)" : "readback (CPU copy)");
 	return TRUE;
 }
 
@@ -478,7 +577,7 @@ perf_report(void)
 	gdouble secs = (now - perf_last_report) / (gdouble)G_USEC_PER_SEC;
 	gdouble n = perf_renders ? perf_renders : 1;
 	fprintf(stderr, "perf[kms]: %.1f vblanks/s  %.1f flips/s  %.1f renders/s  "
-			"vblank->swap avg %.2fms max %.2fms  src blit avg %.2fms max %.2fms  "
+			"vblank->swap avg %.2fms max %.2fms  src blit+xfer avg %.2fms max %.2fms  "
 			"dst draw+swap avg %.2fms max %.2fms\n",
 			perf_ticks / secs, perf_flips / secs, perf_renders / secs,
 			perf_lat_sum / n / 1000, perf_lat_max / 1000,
@@ -503,7 +602,7 @@ render(kms_out_t* o, uint32_t fb_id, const plane_state_t* cur, gint64 vblank_us)
 	}
 	fb_entry_t* cfb = cur->on ? fb_lookup(cur->fb) : NULL;
 
-	o->cur ^= 1;
+	if (o->transfer == XFER_DMABUF) o->cur ^= 1;  // readback has one buffer
 	glBindFramebuffer(GL_FRAMEBUFFER, o->src_fbo[o->cur]);
 	glViewport(0, 0, o->out_w, o->out_h);
 	glUseProgram(src_prog);
@@ -519,13 +618,36 @@ render(kms_out_t* o, uint32_t fb_id, const plane_state_t* cur, gint64 vblank_us)
 				(cur->x + cw) / W * 2 - 1, (cur->y + ch) / H * 2 - 1);
 		glDisable(GL_BLEND);
 	}
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	// The destination GPU samples this buffer next; don't rely on cross-driver
-	// implicit sync.
-	glFinish();
+	const void* pixels = NULL;
+	if (o->transfer == XFER_DMABUF) {
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		// The destination GPU samples this buffer next; don't rely on
+		// cross-driver implicit sync.
+		glFinish();
+	} else {
+		// Synchronous: mapping waits for the read (lowest latency; a second
+		// PBO would overlap the copy with the next frame at +1 frame lag).
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, o->pbo);
+		glReadPixels(0, 0, o->out_w, o->out_h, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+		pixels = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)o->out_w * o->out_h * 4,
+				GL_MAP_READ_BIT);
+		if (!pixels) {
+			fprintf(stderr, "kms: readback map failed\n");
+			glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		}
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	}
 	gint64 t1 = now_us();
 
 	egl_make_current(dst_ctx);
+	if (pixels) {
+		egl_upload_texture(dst_ctx, o->dst_tex[0], o->out_w, o->out_h, o->out_w * 4,
+				GL_BGRA, pixels);
+		src_make_current();
+		glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		egl_make_current(dst_ctx);
+	}
 	egl_draw_quad(dst_ctx, o->dst_tex[o->cur]);
 	egl_swap_buffers(dst_ctx);
 	gint64 t2 = now_us();
@@ -842,31 +964,119 @@ on_window_draw(GtkWidget* widget, void* cr, gpointer data)
 	return TRUE;
 }
 
+// A card with at least one lit output (connector connected to an active CRTC).
+static gboolean
+card_has_lit_output(int fd)
+{
+	drmModeRes* res = drmModeGetResources(fd);
+	if (!res) return FALSE;
+	gboolean lit = FALSE;
+	for (int i = 0; i < res->count_connectors && !lit; i++) {
+		drmModeConnector* c = drmModeGetConnector(fd, res->connectors[i]);
+		if (c && c->connection == DRM_MODE_CONNECTED && c->encoder_id) {
+			drmModeEncoder* e = drmModeGetEncoder(fd, c->encoder_id);
+			if (e && e->crtc_id) {
+				drmModeCrtc* crtc = drmModeGetCrtc(fd, e->crtc_id);
+				lit = crtc && crtc->mode_valid;
+				drmModeFreeCrtc(crtc);
+			}
+			drmModeFreeEncoder(e);
+		}
+		drmModeFreeConnector(c);
+	}
+	drmModeFreeResources(res);
+	return lit;
+}
+
+static gboolean
+same_device(const char* a, const char* b)
+{
+	struct stat sa, sb;
+	return a && b && stat(a, &sa) == 0 && stat(b, &sb) == 0 && sa.st_rdev == sb.st_rdev;
+}
+
+// Default source: a KMS card with lit outputs that isn't the destination's
+// GPU (the destination GPU drives the mirror monitor, so it's lit too).
+static char*
+pick_device(const char* dst_dev)
+{
+	drmDevicePtr devs[16];
+	int n = drmGetDevices2(0, devs, G_N_ELEMENTS(devs));
+	char* pick = NULL;
+	char* same = NULL;
+	for (int i = 0; i < n; i++) {
+		if (!(devs[i]->available_nodes & (1 << DRM_NODE_PRIMARY))) continue;
+		const char* node = devs[i]->nodes[DRM_NODE_PRIMARY];
+		int fd = open(node, O_RDWR | O_CLOEXEC);
+		if (fd < 0) continue;
+		gboolean lit = card_has_lit_output(fd);
+		close(fd);
+		if (!lit) continue;
+		if (same_device(node, dst_dev)) { if (!same) same = g_strdup(node); }
+		else if (!pick) pick = g_strdup(node);
+	}
+	drmFreeDevices(devs, n > 0 ? n : 0);
+	if (!pick && same) {
+		fprintf(stderr, "kms: only the destination GPU has lit outputs; capturing it\n");
+		pick = same;
+		same = NULL;
+	}
+	g_free(same);
+	return pick;
+}
+
 static gboolean
 kms_init(void)
 {
-	if (!config.kms_device) config.kms_device = "/dev/dri/card0";
+	if (config.kms_transfer) {
+		for (int i = 0; i < (int)G_N_ELEMENTS(xfer_names); i++)
+			if (!strcmp(config.kms_transfer, xfer_names[i])) transfer_mode = i;
+		if (strcmp(config.kms_transfer, xfer_names[transfer_mode])) {
+			squint_error("--kms-transfer must be auto, dmabuf or readback");
+			return FALSE;
+		}
+	}
+
+	dst_ctx = egl_init(gdisplay);
+	if (!dst_ctx) return FALSE;
+	char* dst_dev = egl_get_drm_device(dst_ctx);
+	fprintf(stderr, "kms: destination GPU: %s\n", dst_dev ? dst_dev : "(unknown)");
+
+	if (!config.kms_device) {
+		config.kms_device = pick_device(dst_dev);
+		if (!config.kms_device) {
+			g_free(dst_dev);
+			squint_error("No KMS device with lit outputs found (use --kms-device)");
+			return FALSE;
+		}
+	}
+	if (same_device(config.kms_device, dst_dev))
+		fprintf(stderr, "kms: note: source and destination are the same GPU\n");
+	g_free(dst_dev);
+
 	card_fd = open(config.kms_device, O_RDWR | O_CLOEXEC);
 	if (card_fd < 0) {
 		fprintf(stderr, "kms: open %s: %s\n", config.kms_device, strerror(errno));
 		squint_error("Cannot open the KMS device");
 		return FALSE;
 	}
+	fprintf(stderr, "kms: source device %s\n", config.kms_device);
 	drmSetClientCap(card_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
 
+	// GBM/EGL on the render node; some drivers (NVIDIA's GBM backend, older
+	// versions) only accept the primary node, so retry on the card fd.
 	char* rnode = drmGetRenderDeviceNameFromFd(card_fd);
 	render_fd = rnode ? open(rnode, O_RDWR | O_CLOEXEC) : -1;
 	free(rnode);
-	if (render_fd < 0) {
-		squint_error("Cannot open the render node of the KMS device");
-		return FALSE;
-	}
-
-	dst_ctx = egl_init(gdisplay);
-	if (!dst_ctx) return FALSE;
-	if (!src_egl_init()) {
-		squint_error("EGL on the source GPU failed");
-		return FALSE;
+	if (render_fd < 0 || !src_egl_init()) {
+		fprintf(stderr, "kms: retrying source EGL on the primary node\n");
+		src_egl_cleanup();
+		if (render_fd >= 0) close(render_fd);
+		render_fd = dup(card_fd);
+		if (!src_egl_init()) {
+			squint_error("EGL on the source GPU failed");
+			return FALSE;
+		}
 	}
 
 	fd_watch = g_unix_fd_add(card_fd, G_IO_IN, card_fd_cb, NULL);

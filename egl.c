@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <gdk/gdkx.h>
 #include <epoxy/gl.h>
 #include <libdrm/drm_fourcc.h>
@@ -420,6 +421,16 @@ void egl_delete_texture(egl_context_t* ctx, GLuint texture) {
     // it releases that buffer.
     eglMakeCurrent(ctx->egl_display, ctx->egl_surface, ctx->egl_surface, ctx->egl_context);
     glDeleteTextures(1, &texture);
+}
+
+char* egl_get_drm_device(egl_context_t* ctx) {
+    if (!ctx || !epoxy_has_egl_extension(EGL_NO_DISPLAY, "EGL_EXT_device_query")) return NULL;
+    EGLAttrib dev = 0;
+    if (!eglQueryDisplayAttribEXT(ctx->egl_display, EGL_DEVICE_EXT, &dev) || !dev) return NULL;
+    const char* exts = eglQueryDeviceStringEXT((EGLDeviceEXT)dev, EGL_EXTENSIONS);
+    if (!exts || !strstr(exts, "EGL_EXT_device_drm")) return NULL;
+    const char* file = eglQueryDeviceStringEXT((EGLDeviceEXT)dev, EGL_DRM_DEVICE_FILE_EXT);
+    return file ? g_strdup(file) : NULL;
 }
 
 gboolean egl_make_current(egl_context_t* ctx) {

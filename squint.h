@@ -13,6 +13,7 @@ extern struct config {
 	const char* dst_display_name;
 	const char* portal_id;
 	const char* kms_device;
+	const char* kms_transfer;
 
 	gboolean opt_version, opt_window, opt_disable, opt_passive, opt_scale, opt_list_monitors, opt_warp_cursor, opt_perf_log, opt_wayland_source, opt_kms_source;
 	gint opt_limit, opt_rate, opt_switch_threshold;
