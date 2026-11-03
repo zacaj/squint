@@ -27,6 +27,8 @@ RUN dnf install -y \
     libdrm-devel \
     # Wayland source capture (xdg-desktop-portal ScreenCast -> PipeWire)
     pipewire-devel \
+    # KMS source capture (scanout readback + source-GPU GBM/EGL blit)
+    mesa-libgbm-devel \
     # Nested X server for cross-server testing
     xorg-x11-server-Xephyr \
     && dnf clean all

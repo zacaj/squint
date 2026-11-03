@@ -49,6 +49,16 @@ if pw_dep.found() and drm_dep.found() and gio_dep.found()
 	sources += 'wl_capture.c'
 endif
 
+# KMS source capture: scanout readback via libdrm + a GBM/EGL context on the
+# source GPU (blits tiled scanout into a linear buffer the other GPU imports)
+kms_drm_dep = dependency('libdrm', required: get_option('kms_capture'))
+gbm_dep = dependency('gbm', required: get_option('kms_capture'))
+if kms_drm_dep.found() and gbm_dep.found()
+	deps += [kms_drm_dep, gbm_dep]
+	cfg.set('HAVE_KMS', 1)
+	sources += 'kms_capture.c'
+endif
+
 if not have_all_deps
 	warning('NOTE: one or more libraries were not found on your system, squint will work in degraded mode')
 endif

@@ -876,7 +876,7 @@ portal_property_u(const char* name, guint32* out)
 // Public API
 //
 
-gboolean
+static gboolean
 wl_init(void)
 {
 	GError* err = NULL;
@@ -914,7 +914,7 @@ wl_init(void)
 	return TRUE;
 }
 
-int
+static int
 wl_get_sources(GdkRectangle** rects)
 {
 	*rects = g_new0(GdkRectangle, n_sources ? n_sources : 1);
@@ -932,7 +932,7 @@ on_window_draw(GtkWidget* widget, void* cr, gpointer data)
 	return TRUE;  // never let GTK paint over the EGL surface
 }
 
-void
+static void
 wl_enable(void)
 {
 	if (!egl_bind_window(egl_ctx, gdkwin)) {
@@ -947,7 +947,7 @@ wl_enable(void)
 	wl_schedule_render();
 }
 
-void
+static void
 wl_disable(void)
 {
 	if (render_idle_id) {
@@ -958,9 +958,19 @@ wl_disable(void)
 	egl_unbind_window(egl_ctx);
 }
 
-void
+static void
 wl_switch_source(int idx)
 {
 	active = idx;
 	wl_schedule_render();
 }
+
+const capture_backend_t wl_backend = {
+	.name = "wayland-portal",
+	.init = wl_init,
+	.get_sources = wl_get_sources,
+	.enable = wl_enable,
+	.disable = wl_disable,
+	.switch_source = wl_switch_source,
+	.self_enable = TRUE,
+};

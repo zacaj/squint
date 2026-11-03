@@ -1,2 +1,4 @@
 option('wayland_capture', type: 'feature', value: 'auto',
 	description: 'Capture the source from a Wayland compositor via the ScreenCast portal + PipeWire')
+option('kms_capture', type: 'feature', value: 'auto',
+	description: 'Capture the source by reading KMS scanout buffers (libdrm + GBM)')

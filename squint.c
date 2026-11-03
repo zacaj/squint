@@ -483,19 +483,17 @@ init()
 	// already composite the source cursor into the image). Use a blank cursor
 	// over the mirror window so only the composited source cursor shows. In
 	// single-server mode keep the visible X cursor as before.
-	gboolean cross_server = config.opt_wayland_source
+	gboolean cross_server = capture_backend != NULL
 		|| (config.src_display_name && config.dst_display_name
 		    && strcmp(config.src_display_name, config.dst_display_name) != 0);
 	cursor_icon = gdk_cursor_new_for_display(gdisplay,
 			cross_server ? GDK_BLANK_CURSOR : GDK_X_CURSOR);
 
 	gboolean result = x11_init();
-#ifdef HAVE_PIPEWIRE
-	// The Wayland backend starts the portal handshake here; it calls
-	// squint_enable() itself once the streams are known.
-	if (result && config.opt_wayland_source)
-		result = wl_init();
-#endif
+	// Non-X11 source backends. A self_enable backend (the portal one) calls
+	// squint_enable() itself once its sources are known.
+	if (result && capture_backend)
+		result = capture_backend->init();
 
 #ifdef HAVE_APPINDICATOR
 	if (result) {
@@ -642,18 +640,17 @@ free_src_monitors_list()
 // 	n_src_monitors
 // 	dst_rect
 // 	dst_monitor
-#ifdef HAVE_PIPEWIRE
-// Wayland-source variant of select_monitors(): the sources are whatever the
-// portal session shares (chosen in its dialog), not monitors of gdisplay.
+// Backend variant of select_monitors(): the sources come from the capture
+// backend (portal selection, KMS outputs), not from monitors of gdisplay.
 static gboolean
-select_monitors_wayland()
+select_monitors_backend()
 {
 	unselect_monitor(&dst_monitor, &dst_rect);
 	free_src_monitors_list();
 
-	n_src_monitors = wl_get_sources(&src_rects_list);
+	n_src_monitors = capture_backend->get_sources(&src_rects_list);
 	if (n_src_monitors == 0) {
-		squint_error("The screen cast portal shared no monitors");
+		squint_error("The capture backend has no source monitors");
 		return FALSE;
 	}
 	src_rect = src_rects_list[0];
@@ -667,15 +664,12 @@ select_monitors_wayland()
 	}
 	return TRUE;
 }
-#endif
 
 gboolean
 select_monitors()
 {
 	int n;
-#ifdef HAVE_PIPEWIRE
-	if (config.opt_wayland_source) return select_monitors_wayland();
-#endif
+	if (capture_backend) return select_monitors_backend();
 	unselect_monitor(&src_monitor, &src_rect);
 	unselect_monitor(&dst_monitor, &dst_rect);
 	free_src_monitors_list();
@@ -765,14 +759,12 @@ void
 squint_switch_source(int idx)
 {
 	g_assert(idx >= 0 && idx < n_src_monitors);
-#ifdef HAVE_PIPEWIRE
-	if (config.opt_wayland_source) {
+	if (capture_backend) {
 		src_rect = src_rects_list[idx];
-		wl_switch_source(idx);
+		capture_backend->switch_source(idx);
 		squint_show();
 		return;
 	}
-#endif
 	if (src_monitor) g_object_unref(src_monitor);
 	src_monitor = g_object_ref(src_monitors_list[idx]);
 	src_rect = src_rects_list[idx];
@@ -877,11 +869,9 @@ squint_enable()
 		{
 			enable_window();
 
-#ifdef HAVE_PIPEWIRE
-			if (config.opt_wayland_source)
-				wl_enable();
+			if (capture_backend)
+				capture_backend->enable();
 			else
-#endif
 			x11_enable();
 
 			enabled = TRUE;
@@ -900,11 +890,9 @@ squint_disable(const char* reason)
 
 	enabled = FALSE;
 
-#ifdef HAVE_PIPEWIRE
-	if (config.opt_wayland_source)
-		wl_disable();
+	if (capture_backend)
+		capture_backend->disable();
 	else
-#endif
 	x11_disable();
 
 	disable_window();
@@ -935,8 +923,14 @@ GOptionEntry option_entries[] = {
   { "wayland-source",	0,	0,	G_OPTION_ARG_NONE,	&config.opt_wayland_source,	"Capture the source from the Wayland session via the screen cast portal (sources = monitors picked in the portal dialog, ordered left to right)", NULL},
   { "portal-id",	0,	0,	G_OPTION_ARG_STRING,	&config.portal_id,	"Name under which the portal permission (restore token) is remembered; use a distinct one per mirror (default: \"default\")", "NAME"},
 #endif
+#ifdef HAVE_KMS
+  { "kms-source",	0,	0,	G_OPTION_ARG_NONE,	&config.opt_kms_source,	"Capture the source by reading the scanout buffers of a KMS device directly (needs CAP_SYS_ADMIN; sources = connector names like DP-1, comma-separated, default all lit outputs)", NULL},
+  { "kms-device",	0,	0,	G_OPTION_ARG_STRING,	&config.kms_device,	"DRM device to capture with --kms-source (default /dev/dri/card0)", "PATH"},
+#endif
   { NULL }
 };
+
+const capture_backend_t* capture_backend = NULL;
 
 void
 list_monitors()
@@ -1013,6 +1007,19 @@ main (int argc, char *argv[])
 		return 0;
 	}
 
+#ifdef HAVE_PIPEWIRE
+	if (config.opt_wayland_source) capture_backend = &wl_backend;
+#endif
+#ifdef HAVE_KMS
+	if (config.opt_kms_source) {
+		if (capture_backend) {
+			squint_error("--wayland-source and --kms-source are mutually exclusive");
+			return 1;
+		}
+		capture_backend = &kms_backend;
+	}
+#endif
+
 	// initialisation
 	if (!init()) {
 		return 1;
@@ -1062,15 +1069,17 @@ main (int argc, char *argv[])
 	}
 
 	// Resolve numeric monitor specs now that gdisplay/src_gdisplay are available
-	resolve_monitor_number(src_gdisplay, &config.src_monitor_name);
+	// (backend sources are resolved by the backend itself)
+	if (!capture_backend)
+		resolve_monitor_number(src_gdisplay, &config.src_monitor_name);
 	resolve_monitor_number(gdisplay, &config.dst_monitor_name);
 
 	if (config.opt_wayland_source && config.src_monitor_name)
 		fprintf(stderr, "warning: source monitors are chosen in the portal dialog with "
 				"--wayland-source; ignoring '%s'\n", config.src_monitor_name);
 
-	// activation (the Wayland backend enables itself once the portal is ready)
-	if (!config.opt_disable && !config.opt_wayland_source) {
+	// activation (a self_enable backend enables itself once it is ready)
+	if (!config.opt_disable && !(capture_backend && capture_backend->self_enable)) {
 		squint_enable();
 	}
 

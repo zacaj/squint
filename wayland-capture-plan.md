@@ -82,3 +82,26 @@ B measures meaningfully laggy — and not until the freeze investigation clears 
 - Verified: builds; fails cleanly without a portal. **Not yet run against a real
   KWin/portal** — next step is `tools/wayland-nested-test.sh`, then a real Wayland login.
 - Not done: active-window follow (KWin script), tray source-menu still lists dst monitors.
+
+## KMS variant (option A, branch `wayland-kms`)
+`kms_capture.c`, behind meson option `kms_capture` (`HAVE_KMS`; libdrm + gbm).
+Both backends share the `capture_backend_t` interface in `squint.h`.
+
+- Pacing: DRM vblank event on the active CRTC; a primary-plane FB_ID change = new frame.
+- Source GPU (GBM/EGL, surfaceless): import the scanout FB with its real modifier
+  (multi-plane DCC ok), composite the HW cursor plane, write into a linear GBM BO
+  (double-buffered), `glFinish`. Destination GPU imports each linear BO once.
+- Cursor-follow: whichever CRTC has its cursor plane enabled.
+- Needs CAP_SYS_ADMIN for GETFB2 handles: `sudo setcap cap_sys_admin+ep builddir/squint`
+  (redo after every rebuild).
+- Limits: overlay planes (direct-scanout video) are not composited; plane scaling/
+  rotation are ignored; software cursor = no cursor-follow; sources are laid out left to
+  right in selection order (KMS has no logical layout).
+
+Run (sources = connector names or 1-based numbers, as printed at startup):
+
+    squint --kms-source [--kms-device /dev/dri/card0] --dst-display :1 --perf-log DP-1,DP-2
+
+Compare against the portal backend with `--perf-log`:
+- `perf[kms]`: vblank->swap = latch of the new flip -> our swap returned.
+- `perf[wl]`: pts->swap = compositor's frame timestamp -> our swap returned.

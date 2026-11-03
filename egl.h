@@ -56,5 +56,9 @@ void egl_delete_texture(egl_context_t* ctx, GLuint texture);
 // squint_disable()/squint_enable() cycle, as opposed to process shutdown.
 void egl_unbind_window(egl_context_t* ctx);
 
+// Make this context (and its bound window surface, if any) current again,
+// e.g. after another EGL context in the process was used.
+gboolean egl_make_current(egl_context_t* ctx);
+
 // Cleanup and destroy EGL context
 void egl_cleanup(egl_context_t* ctx);

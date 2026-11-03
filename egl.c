@@ -422,6 +422,11 @@ void egl_delete_texture(egl_context_t* ctx, GLuint texture) {
     glDeleteTextures(1, &texture);
 }
 
+gboolean egl_make_current(egl_context_t* ctx) {
+    if (!ctx) return FALSE;
+    return eglMakeCurrent(ctx->egl_display, ctx->egl_surface, ctx->egl_surface, ctx->egl_context);
+}
+
 void egl_unbind_window(egl_context_t* ctx) {
     if (!ctx) return;
 
