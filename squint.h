@@ -45,6 +45,7 @@ void x11_enable();
 void x11_disable();
 void x11_switch_source();
 void x11_reposition_window(GdkWindow* win, int x, int y);
+void x11_watch_screen_changes(void);
 
 // Wayland source backend (wl_capture.c): portal ScreenCast + PipeWire
 #ifdef HAVE_PIPEWIRE

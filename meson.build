@@ -38,13 +38,24 @@ if cfg.has('HAVE_XFIXES') and cfg.has('HAVE_XRENDER')
 	cfg.set('COPY_CURSOR', 1)
 endif
 
+# Wayland source capture: xdg-desktop-portal ScreenCast (GIO D-Bus) + PipeWire
+sources = ['squint.c', 'x11.c', 'egl.c']
+pw_dep = dependency('libpipewire-0.3', required: get_option('wayland_capture'))
+drm_dep = dependency('libdrm', required: get_option('wayland_capture'))
+gio_dep = dependency('gio-unix-2.0', required: get_option('wayland_capture'))
+if pw_dep.found() and drm_dep.found() and gio_dep.found()
+	deps += [pw_dep, drm_dep, gio_dep]
+	cfg.set('HAVE_PIPEWIRE', 1)
+	sources += 'wl_capture.c'
+endif
+
 if not have_all_deps
 	warning('NOTE: one or more libraries were not found on your system, squint will work in degraded mode')
 endif
 
 configure_file(configuration: cfg, output: 'config.h')
 
-executable('squint', 'squint.c', 'x11.c', 'egl.c', dependencies: deps, install: true)
+executable('squint', sources, dependencies: deps, install: true)
 install_data('squint.png')
 install_data('squint-disabled.png')
 install_data('squint.desktop', install_dir: get_option('datadir') + '/applications')

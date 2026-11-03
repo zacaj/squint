@@ -1131,6 +1131,58 @@ x11_randr_reenable_cb(gpointer data)
 }
 #endif
 
+#ifdef HAVE_XRANDR
+static void
+x11_handle_randr_event(XEvent* ev)
+{
+	if (xrandr_event_base)
+	{
+		if (ev->type == xrandr_event_base + RRScreenChangeNotify) {
+			// RRScreenChangeNotify is a per-root-window broadcast: it fires
+			// for every client that selected it on this root, regardless of
+			// which output actually changed. So a HDMI hotplug on :1 also
+			// disables a mirror whose own output (e.g. DP-3) never moved --
+			// log the full connector snapshot so that's distinguishable
+			// after the fact from a change that genuinely affects us.
+			char* outputs = x11_describe_randr_outputs(display);
+			fprintf(stderr, "x11: RandR screen change on %s -- %s\n",
+				DisplayString(display), outputs);
+			g_free(outputs);
+			squint_disable("RandR screen change");
+
+			if (randr_reenable_source_id) {
+				g_source_remove(randr_reenable_source_id);
+			}
+			randr_reenable_source_id = g_timeout_add(
+				RANDR_REENABLE_DEBOUNCE_MS, x11_randr_reenable_cb, NULL);
+		}
+	}
+}
+
+// Wayland-source mode: x11_enable() (and its catch-all event filter) never
+// runs, but a destination-monitor hotplug must still disable/re-enable the
+// mirror. Only RandR is handled here -- the other x11_on_x11_event branches
+// would act on :1's pointer/focus against the Wayland source rects.
+static GdkFilterReturn
+x11_on_randr_only_event(GdkXEvent* xevent, GdkEvent* event, gpointer data)
+{
+	x11_handle_randr_event((XEvent*)xevent);
+	return GDK_FILTER_CONTINUE;
+}
+#endif
+
+void
+x11_watch_screen_changes(void)
+{
+#ifdef HAVE_XRANDR
+	static gboolean installed = FALSE;
+	if (!installed) {
+		gdk_window_add_filter(NULL, x11_on_randr_only_event, NULL);
+		installed = TRUE;
+	}
+#endif
+}
+
 GdkFilterReturn
 x11_on_x11_event (GdkXEvent *xevent, GdkEvent *event, gpointer data)
 {
@@ -1305,28 +1357,7 @@ x11_on_x11_event (GdkXEvent *xevent, GdkEvent *event, gpointer data)
 #endif
 
 #ifdef HAVE_XRANDR
-	if (xrandr_event_base)
-	{
-		if (ev->type == xrandr_event_base + RRScreenChangeNotify) {
-			// RRScreenChangeNotify is a per-root-window broadcast: it fires
-			// for every client that selected it on this root, regardless of
-			// which output actually changed. So a HDMI hotplug on :1 also
-			// disables a mirror whose own output (e.g. DP-3) never moved --
-			// log the full connector snapshot so that's distinguishable
-			// after the fact from a change that genuinely affects us.
-			char* outputs = x11_describe_randr_outputs(display);
-			fprintf(stderr, "x11: RandR screen change on %s -- %s\n",
-				DisplayString(display), outputs);
-			g_free(outputs);
-			squint_disable("RandR screen change");
-
-			if (randr_reenable_source_id) {
-				g_source_remove(randr_reenable_source_id);
-			}
-			randr_reenable_source_id = g_timeout_add(
-				RANDR_REENABLE_DEBOUNCE_MS, x11_randr_reenable_cb, NULL);
-		}
-	}
+	x11_handle_randr_event(ev);
 #endif
 	return GDK_FILTER_CONTINUE;
 }

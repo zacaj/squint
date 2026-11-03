@@ -73,3 +73,12 @@ B measures meaningfully laggy — and not until the freeze investigation clears 
 2. Is the switch of `:0` to Wayland already decided, or should this stay a side mode
    while X11 `:0` remains the default?
 3. OK to add `pipewire-devel` to the devcontainer and a `libpipewire-0.3` meson dep?
+
+## Status
+- Implemented: portal handshake + restore token, PipeWire consumer on the GLib loop,
+  linear DMA-BUF import with SHM fallback, metadata-cursor overlay + cursor-follow,
+  `--perf-log` pts->swap latency, dst RandR hotplug handling, meson option
+  `-Dwayland_capture=auto|enabled|disabled` (`HAVE_PIPEWIRE`).
+- Verified: builds; fails cleanly without a portal. **Not yet run against a real
+  KWin/portal** — next step is `tools/wayland-nested-test.sh`, then a real Wayland login.
+- Not done: active-window follow (KWin script), tray source-menu still lists dst monitors.

@@ -481,7 +481,13 @@ on_stream_param_changed(void* data, uint32_t id, const struct spa_pod* param)
 	const struct spa_pod* params[8];
 	int n = 0;
 
-	if (mod && (mod->flags & SPA_POD_PROP_FLAG_DONT_FIXATE)) {
+	// A plain (non-choice) LINEAR value is already fixed, whatever the flags
+	// say; only renegotiate when the producer really left a choice open,
+	// otherwise a producer that echoes DONT_FIXATE back would loop forever.
+	int64_t mod_value = 0;
+	gboolean mod_fixed = mod && spa_pod_get_long(&mod->value, &mod_value) == 0
+		&& (uint64_t)mod_value == DRM_FORMAT_MOD_LINEAR;
+	if (mod && !mod_fixed && (mod->flags & SPA_POD_PROP_FLAG_DONT_FIXATE)) {
 		// Producer left the modifier open for us to pick; we only ever accept
 		// LINEAR, so answer with that single fixed choice and wait for the
 		// renegotiated format.
@@ -553,10 +559,14 @@ on_stream_process(void* data)
 
 	struct spa_meta_header* h = spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(*h));
 	struct spa_data* d = &buf->datas[0];
+	// Cursor-only updates (metadata cursor moved, picture unchanged) come as
+	// buffers with an empty chunk -- for DMA-BUFs too, whose fd is always
+	// valid, so the size is the only reliable "new picture" signal.
 	gboolean has_frame = d->chunk != NULL
+		&& d->chunk->size > 0
 		&& !(d->chunk->flags & SPA_CHUNK_FLAG_CORRUPTED)
 		&& !(h && (h->flags & SPA_META_HEADER_FLAG_CORRUPTED))
-		&& (s->is_dmabuf ? d->fd >= 0 : (d->data && d->chunk->size > 0));
+		&& (s->is_dmabuf ? d->fd >= 0 : d->data != NULL);
 
 	if (has_frame) {
 		// Keep this buffer (the compositor won't write into it until we give
@@ -840,20 +850,26 @@ on_session_created(guint32 response, GVariant* results)
 	g_free(token);
 }
 
-static guint32
-portal_property_u(const char* name)
+static gboolean
+portal_property_u(const char* name, guint32* out)
 {
+	GError* err = NULL;
 	GVariant* ret = g_dbus_connection_call_sync(bus, PORTAL_BUS, PORTAL_PATH,
 			"org.freedesktop.DBus.Properties", "Get",
 			g_variant_new("(ss)", PORTAL_SC, name), G_VARIANT_TYPE("(v)"),
-			G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL);
-	if (!ret) return 0;
+			G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
+	if (!ret) {
+		fprintf(stderr, "wl: screen cast portal unavailable: %s\n", err->message);
+		g_clear_error(&err);
+		return FALSE;
+	}
 	GVariant* v;
 	g_variant_get(ret, "(v)", &v);
 	guint32 val = g_variant_is_of_type(v, G_VARIANT_TYPE_UINT32) ? g_variant_get_uint32(v) : 0;
 	g_variant_unref(v);
 	g_variant_unref(ret);
-	return val;
+	*out = val;
+	return TRUE;
 }
 
 //
@@ -870,7 +886,11 @@ wl_init(void)
 		return FALSE;
 	}
 
-	guint32 modes = portal_property_u("AvailableCursorModes");
+	guint32 modes = 0;
+	if (!portal_property_u("AvailableCursorModes", &modes)) {
+		squint_error("No xdg-desktop-portal ScreenCast service on the session bus");
+		return FALSE;
+	}
 	if (!(modes & CURSOR_MODE_METADATA)) {
 		fprintf(stderr, "wl: portal lacks metadata cursors (modes=0x%x); using embedded "
 				"cursor, cursor-follow disabled\n", modes);
@@ -879,6 +899,8 @@ wl_init(void)
 
 	egl_ctx = egl_init(gdisplay);
 	if (!egl_ctx) return FALSE;
+
+	x11_watch_screen_changes();
 
 	char* token = new_request(on_session_created);
 	char* stoken = g_strdup_printf("squint_session%d", getpid());
@@ -901,6 +923,15 @@ wl_get_sources(GdkRectangle** rects)
 	return n_sources;
 }
 
+static gboolean
+on_window_draw(GtkWidget* widget, void* cr, gpointer data)
+{
+	// Expose/map (e.g. squint_show() remapping the fullscreen window): a
+	// static screen sends no new frames, so redraw the held one ourselves.
+	wl_schedule_render();
+	return TRUE;  // never let GTK paint over the EGL surface
+}
+
 void
 wl_enable(void)
 {
@@ -909,6 +940,8 @@ wl_enable(void)
 		return;
 	}
 	bound = TRUE;
+	gtk_widget_set_app_paintable(gtkwin, TRUE);
+	g_signal_connect(gtkwin, "draw", G_CALLBACK(on_window_draw), NULL);
 	pending_switch = -1;
 	if (active >= n_sources) active = 0;
 	wl_schedule_render();

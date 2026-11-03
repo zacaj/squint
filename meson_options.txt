@@ -1,0 +1,2 @@
+option('wayland_capture', type: 'feature', value: 'auto',
+	description: 'Capture the source from a Wayland compositor via the ScreenCast portal + PipeWire')
